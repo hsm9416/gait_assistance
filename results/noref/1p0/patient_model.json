@@ -1,0 +1,279 @@
+{
+  "assist_mode": "baseline_stabilization",
+  "target_mode": "patient_baseline",
+  "normalizer": {
+    "std_floor": 1e-08,
+    "stats": {
+      "mean": [
+        -138.69027744107748,
+        4.0637414141414085,
+        0.07781784511784533,
+        0.9871381144781155,
+        0.015061144781144585
+      ],
+      "std": [
+        45.369524539122736,
+        307.6870465250767,
+        0.1495925819824659,
+        0.20111540024884256,
+        1.4405269729024872
+      ],
+      "n_samples": 1500,
+      "feature_names": [
+        "belt_length",
+        "belt_velocity",
+        "accel_x",
+        "accel_y",
+        "gyro_z"
+      ]
+    }
+  },
+  "clusters": {
+    "k": 1,
+    "centroid_vectors": [
+      [
+        -0.11754608011588091,
+        0.0632231543106177,
+        0.1586652649560985,
+        0.28679174408662256,
+        -0.11022556206692889,
+        -0.19972102153631013,
+        -0.5166997865661793,
+        -0.5591579467639658,
+        -0.006252262669236304,
+        -0.09318709578851646,
+        -0.12511758084919192,
+        0.15909823329531833,
+        -0.12081958179038826,
+        0.2282243763738254,
+        -0.03049727619140715
+      ]
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "silhouette": NaN,
+    "stability": 1.0,
+    "inertia": 6.553508472349788,
+    "distances": [
+      0.558676856727861,
+      0.5245258102423968,
+      0.48040316429993773,
+      0.5358181272812977,
+      0.5017896065452669,
+      0.5846837941302683,
+      0.688581078028634,
+      0.6902638805182431,
+      0.6228020270926983,
+      0.5774511724743804,
+      0.5137952605744261,
+      0.7565029306940864,
+      0.8164462252058099,
+      0.7988921197034325,
+      1.0206318844340692
+    ],
+    "n_strides": 15,
+    "warnings": [
+      "clustered 15 strides, below the recommended 30 (30-50): the silhouette and stability gates are weakly powered at this sample size, so treat the gait states as provisional"
+    ],
+    "k_selection": [
+      {
+        "k": 2,
+        "silhouette": 0.3188622798831652,
+        "stability": 1.0,
+        "min_cluster_size": 7,
+        "required_cluster_size": 3,
+        "accepted": false,
+        "reason": "silhouette below threshold"
+      },
+      {
+        "k": 3,
+        "silhouette": 0.33676951270424976,
+        "stability": 0.7451635269127439,
+        "min_cluster_size": 3,
+        "required_cluster_size": 3,
+        "accepted": false,
+        "reason": "silhouette below threshold"
+      },
+      {
+        "k": 4,
+        "silhouette": 0.2794833339967166,
+        "stability": 0.6086666143276428,
+        "min_cluster_size": 3,
+        "required_cluster_size": 3,
+        "accepted": false,
+        "reason": "silhouette below threshold"
+      }
+    ]
+  },
+  "z_patient": [
+    [
+      -0.11754608011588091,
+      0.04470552114104127,
+      0.11219328478921753,
+      0.20279238703196778,
+      -0.0779412423976241
+    ],
+    [
+      0.04470552114104127,
+      -0.19972102153631013,
+      -0.3653619229185871,
+      -0.3953843759111468,
+      -0.0044210173311764935
+    ],
+    [
+      0.11219328478921753,
+      -0.3653619229185871,
+      -0.09318709578851646,
+      -0.0884714898641197,
+      0.11249943963791895
+    ],
+    [
+      0.20279238703196778,
+      -0.3953843759111468,
+      -0.0884714898641197,
+      -0.12081958179038826,
+      0.16137900416600282
+    ],
+    [
+      -0.0779412423976241,
+      -0.0044210173311764935,
+      0.11249943963791895,
+      0.16137900416600282,
+      -0.03049727619140715
+    ]
+  ],
+  "z_target": [
+    [
+      -0.11754608011588091,
+      0.04470552114104127,
+      0.11219328478921753,
+      0.20279238703196778,
+      -0.0779412423976241
+    ],
+    [
+      0.04470552114104127,
+      -0.19972102153631013,
+      -0.3653619229185871,
+      -0.3953843759111468,
+      -0.0044210173311764935
+    ],
+    [
+      0.11219328478921753,
+      -0.3653619229185871,
+      -0.09318709578851646,
+      -0.0884714898641197,
+      0.11249943963791895
+    ],
+    [
+      0.20279238703196778,
+      -0.3953843759111468,
+      -0.0884714898641197,
+      -0.12081958179038826,
+      0.16137900416600282
+    ],
+    [
+      -0.0779412423976241,
+      -0.0044210173311764935,
+      0.11249943963791895,
+      0.16137900416600282,
+      -0.03049727619140715
+    ]
+  ],
+  "z_healthy": null,
+  "ood_threshold": 1.081524597253909,
+  "features": [
+    "belt_length",
+    "belt_velocity",
+    "accel_x",
+    "accel_y",
+    "gyro_z"
+  ],
+  "mean_metrics": {
+    "stride_time": 1.2251006835333405,
+    "swing_time": 0.4894425313333309,
+    "stance_time": 0.7356581522000095,
+    "swing_ratio": 0.3995022888908774,
+    "stance_ratio": 0.6004977111091225,
+    "swing_stance_ratio": 0.6653805219012425,
+    "belt_excursion": 154.98,
+    "peak_belt_velocity": 743.7533333333333,
+    "mean_belt_length": -138.57473899519627,
+    "trunk_acc_rms": 0.20399865866726946,
+    "trunk_gyro_rms": 1.774516509410099
+  },
+  "summary": {
+    "assist_mode": "baseline_stabilization",
+    "target_mode": "patient_baseline",
+    "healthy_region_threshold": NaN,
+    "n_baseline_strides": 15,
+    "features": [
+      "belt_length",
+      "belt_velocity",
+      "accel_x",
+      "accel_y",
+      "gyro_z"
+    ],
+    "k": 1,
+    "silhouette": NaN,
+    "stability": 1.0,
+    "cluster_sizes": {
+      "0": 15
+    },
+    "k_selection": [
+      {
+        "k": 2,
+        "silhouette": 0.3188622798831652,
+        "stability": 1.0,
+        "min_cluster_size": 7,
+        "required_cluster_size": 3,
+        "accepted": false,
+        "reason": "silhouette below threshold"
+      },
+      {
+        "k": 3,
+        "silhouette": 0.33676951270424976,
+        "stability": 0.7451635269127439,
+        "min_cluster_size": 3,
+        "required_cluster_size": 3,
+        "accepted": false,
+        "reason": "silhouette below threshold"
+      },
+      {
+        "k": 4,
+        "silhouette": 0.2794833339967166,
+        "stability": 0.6086666143276428,
+        "min_cluster_size": 3,
+        "required_cluster_size": 3,
+        "accepted": false,
+        "reason": "silhouette below threshold"
+      }
+    ],
+    "ood_threshold": 1.081524597253909,
+    "alpha": 0.3,
+    "has_healthy_reference": false,
+    "d_patient_mean": 0.644750929196854,
+    "d_patient_std": 0.14559122268568503,
+    "d_target_mean": 0.644750929196854,
+    "d_target_std": 0.14559122268568503,
+    "warnings": [
+      "clustered 15 strides, below the recommended 30 (30-50): the silhouette and stability gates are weakly powered at this sample size, so treat the gait states as provisional",
+      "patient-specific baseline built from 15 strides; 30-50 is recommended before the gait states are treated as settled",
+      "no healthy reference: running in BASELINE_STABILIZATION, so d_healthy is undefined and the deviation score measures departure from this patient's own baseline, not pathology"
+    ]
+  }
+}
