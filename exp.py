@@ -13,6 +13,9 @@
     python exp.py step6      live: full assistance
     python exp.py feel       live: bring-up, gain held at 0.8 so the force is
                              deterministic - use it when nothing is felt
+    python exp.py simple     live: step0 -> step3 -> step4 -> step6, the short
+                             route to assistance    (430 s, one run folder)
+    python exp.py full       live: every stage in order              (700 s)
     python exp.py sim:step3  same monitor against the mock device (no hardware)
     python exp.py summary    re-print the table
 
@@ -38,6 +41,7 @@ import sys, time, pathlib, pandas as pd
 from gait_assistance.control.impedance_controller import IMPEDANCE_HEADROOM_N
 from gait_assistance.manifold.reference import ReferenceBank
 from gait_assistance.main import main as cli
+from gait_assistance.state_machine import SystemState
 
 # --------------------------------------------------------------------------- #
 # parameters
@@ -244,6 +248,57 @@ LIVE = {
 
 #: Stages that run before a patient model exists, so they load no reference.
 PRE_MODEL = {"step0", "step1"}
+
+# Stage sequences run back to back in one invocation.  Every stage writes into
+# the same logs/<date>_<time>/ folder, so `python plot_exp.py` with no argument
+# draws the whole session.
+#
+# "simple" is the short route to assistance and still keeps the two things the
+# graded protocol exists for: the link and safety check before the wearer
+# stands up (step0), and the whole algorithm verified with the motor clamped
+# off (step3).  It then opens the motor at the LOWEST force (step4) before the
+# full one (step6).  What it drops is step1/step2 - both are covered inside
+# step3's longer run - and step5, the middle force rung.
+#
+# "full" is the protocol as written, every stage in order.
+#
+# A stage that ends badly (interrupted, dead link, motor not confirmed at 0 A)
+# stops the chain: the next stage would open the motor on a device whose state
+# is not known.
+CHAINS = {
+    "simple": ("step0", "step3", "step4", "step6"),        # 10+180+60+180 = 430 s
+    "full": ("step0", "step1", "step2", "step3",
+             "step4", "step5", "step6"),                   # 700 s
+}
+
+# What each verification stage is FOR, as a condition on the running system.
+# A stage whose purpose is to build the model has nothing left to do once the
+# model exists, so its entry in LIVE is a *timeout*, not a target: the stage
+# ends when its goal is met, and standing on a treadmill waiting out a timer is
+# not free.  A stage that reaches its timeout without meeting its goal has not
+# confirmed its layer, so it counts as a failure and stops a chain - which is
+# exactly the rule the graded protocol is built on: the motor is not opened on
+# a layer that was not confirmed.
+#
+# step4-step6 deliberately have no goal.  Their purpose is time under
+# assistance, and the obvious condition ("the wearer felt a force") cannot be
+# required: on a wearer with no deficit the gain is correctly near zero, so a
+# goal would abort the chain on healthy gait.
+GOALS = {
+    "step0": ("300 frames with no safe stop",
+              lambda r: r.low.cycles >= 300
+              and r.states.state is not SystemState.SAFE_STOP),
+    "step1": ("5 strides segmented",
+              lambda r: len(r.baseline_stride_ids) >= 5),
+    "step2": ("patient model built",
+              lambda r: r.high is not None),
+    "step3": ("10 strides analysed with a gain computed",
+              lambda r: r.high is not None and len(r.high.outputs) >= 10),
+}
+
+#: Seconds between the stages of a chain, to let the wearer settle.  The motor
+#: opens between some of them, so the banner says what is about to change.
+CHAIN_PAUSE_S = 5.0
 
 # --------------------------------------------------------------------------- #
 
@@ -518,19 +573,27 @@ def _run_monitored(stage, duration, overrides, simulated=False):
             "current_a", "saturated", "faults",
         ])
 
-    print(f"[{stage}] {duration:.0f}s  {stride_csv}")
+    goal = GOALS.get(stage)
+    print(f"[{stage}] {duration:.0f}s{' max' if goal else ''}  {stride_csv}")
+    if goal is not None:
+        print(f"         goal: {goal[0]} - the stage ends there")
     for k, v in overrides.items():
         print(f"         {k} = {v}")
     _report_force_budget(stage, runtime.low.impedance, config)
     print("         Ctrl+C = emergency stop\n")
+    ok = True
+    started = time.monotonic()
     try:
         runtime.run(duration_s=duration, realtime=True,
-                    on_cycle=_monitor(runtime, duration, cycle_writer))
+                    on_cycle=_monitor(runtime, duration, cycle_writer),
+                    until=(lambda: goal[1](runtime)) if goal else None)
     except KeyboardInterrupt:
+        ok = False
         runtime.low.safety.trigger_emergency_stop("keyboard interrupt")
         runtime.stop()
         print("\n[info] interrupted by the operator")
     except OSError as exc:
+        ok = False
         # the serial link died mid-run (USB unplugged, device reset): every
         # later write fails with Errno 5.  runtime.run() has already stopped
         # the loop in its own finally, so there is nothing left to command -
@@ -550,16 +613,28 @@ def _run_monitored(stage, duration, overrides, simulated=False):
         problems += sensors.close_errors
         problems += [f"motor {e}" for e in runtime.low.stop_errors]
         if problems:
+            ok = False
             print("\n[warn] the shutdown did not complete cleanly:")
             for problem in problems:
                 print(f"         {problem}")
             if runtime.low.stop_errors:
                 print("         the motor was NOT confirmed at 0 A - power the "
                       "device off before taking it off")
+    elapsed = time.monotonic() - started
+    if goal is not None:
+        if goal[1](runtime):
+            print(f"\n[{stage}] goal reached: {goal[0]}  "
+                  f"({elapsed:.1f}s of the {duration:.0f}s timeout)")
+        else:
+            ok = False
+            print(f"\n[{stage}] GOAL NOT REACHED: {goal[0]} - ran the full "
+                  f"{duration:.0f}s timeout.  The layer is not confirmed; do "
+                  f"not open the motor on it")
     print(f"\n[{stage}] done -> {stride_csv}"
           + (f" + {cycles_csv}" if CYCLE_LOG else ""))
     if CYCLE_LOG:
         torque(stage, run=out_dir)
+    return ok
 
 
 def _report_force_budget(stage, impedance, config):
@@ -629,8 +704,49 @@ def live(stage, simulated=False):
     if stage not in PRE_MODEL:                # step0/step1 build no model
         # the reference has to come from the same detector as the run
         detector["reference.path"] = reference_for(name)
-    _run_monitored(stage, duration, {**ASSIST, **detector, **overrides},
-                   simulated=simulated)
+    return _run_monitored(stage, duration, {**ASSIST, **detector, **overrides},
+                          simulated=simulated)
+
+
+def chain(name, simulated=False):
+    """Run a sequence of live stages back to back, into one run folder.
+
+    Args:
+        name: key of :data:`CHAINS`.
+        simulated: run against the mock device instead of the hardware.
+
+    Returns:
+        True when every stage finished cleanly.  A stage that did not stops the
+        chain, because the next one would open the motor on a device whose
+        state is no longer known.
+    """
+    stages = CHAINS[name]
+    plan = "  ".join(f"{s}({LIVE[s][0]:.0f}s{'max' if s in GOALS else ''})"
+                     for s in stages)
+    total = sum(LIVE[s][0] for s in stages)
+    fixed = sum(LIVE[s][0] for s in stages if s not in GOALS)
+    print(f"\n=== chain {name}: {plan} ===")
+    print(f"    at most {total:.0f}s ({total / 60:.1f} min); the goal-bounded "
+          f"stages usually end early, so expect about {fixed:.0f}s plus their "
+          f"goals")
+    print(f"    logs -> {run_dir()}")
+    for index, stage in enumerate(stages):
+        if index:
+            limit = LIVE[stage][1].get(
+                "impedance.current_limit_a", ASSIST["impedance.current_limit_a"])
+            opens = "motor OFF" if limit <= 0.0 else f"motor up to {limit:.1f} A"
+            print(f"\n--- {name} {index + 1}/{len(stages)}: {stage} "
+                  f"({opens}) in {CHAIN_PAUSE_S:.0f}s ---")
+            if not simulated:
+                time.sleep(CHAIN_PAUSE_S)
+        if not live(stage, simulated=simulated):
+            print(f"\n[abort] {stage} did not finish cleanly; the rest of the "
+                  f"{name} chain ({', '.join(stages[index + 1:]) or 'nothing'}) "
+                  f"was not run")
+            return False
+    print(f"\n=== chain {name} complete: {', '.join(stages)} -> {run_dir()} ===")
+    print("    python plot_exp.py        # every stage of this run")
+    return True
 
 
 def torque(stage, run=None):
@@ -677,12 +793,18 @@ def main(names):
             offline(name)
         elif name in LIVE:
             live(name)
+        elif name in CHAINS:
+            chain(name)
         elif name == "noref":
             for r in RUNS:
                 offline(r, out=f"{OUT}/noref", ref=False)
             summary(f"{OUT}/noref")
         elif name.startswith("sim:"):
-            live(name[4:], simulated=True)
+            target = name[4:]
+            if target in CHAINS:
+                chain(target, simulated=True)
+            else:
+                live(target, simulated=True)
         elif name.startswith("torque:"):
             torque(name[7:])
         elif name == "summary":

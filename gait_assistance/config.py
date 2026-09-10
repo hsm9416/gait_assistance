@@ -464,6 +464,13 @@ class AssistConfig:
     #: stride and held in between; ``1`` restores per-stride updates.  A
     #: safety veto and the OOD cap are never held - only a rise or a normal
     #: release waits for the interval.
+    #:
+    #: The interval applies only once the gain has *settled*.  While it is
+    #: still climbing, holding it would add the interval to an already
+    #: rate-limited rise, so the gain is recomputed every stride until it has
+    #: stopped changing for ``gain_converged_strides`` strides; the hold then
+    #: keeps that settled value steady.  A later change starts the climb again.
+    gain_converged_strides: int = 10
     gain_update_interval_strides: int = 3
     profile: str = "sine"             #: "sine" | "raised_cosine" | "trapezoid"
     max_retraction_mm: float = 30.0

@@ -411,6 +411,59 @@ python -m gait_assistance.main simulate --duration 120 --fast --drift-after 60
 python -m gait_assistance.main live --port /dev/ttyUSB0 --duration 60
 ```
 
+실험은 `exp.py`로 돌립니다. 개별 스텝 외에 **스텝을 이어 붙인 체인** 두 개가
+있습니다. 한 번의 실행이므로 모든 스텝이 **같은 `logs/<날짜>_<시각>/` 폴더**에
+기록되고, `python plot_exp.py`만 치면 세션 전체가 그려집니다.
+
+```bash
+python exp.py simple    # step0 -> step3 -> step4 -> step6   (430 s)
+python exp.py full      # step0 .. step6 전부                (700 s)
+python exp.py sim:simple  # 장치 없이 같은 순서로 리허설
+```
+
+`simple`은 보조까지 가는 짧은 경로이지만 등급 프로토콜의 핵심 두 가지는
+유지합니다 — 착용자가 일어서기 전의 링크·안전 점검(step0), 그리고 모터를 끈
+상태에서 알고리즘 전체 검증(step3). 그 다음 **가장 낮은 힘(step4)** 으로 모터를
+열고 나서 전체 보조(step6)로 갑니다. 빠지는 것은 step1·step2(더 긴 step3 안에서
+함께 확인됨)와 중간 힘 단계인 step5입니다.
+
+스텝이 깨끗하게 끝나지 않으면(중단, 링크 사망, 모터 0 A 확인 실패, **목표 미달**)
+**체인은 거기서 멈춥니다.** 다음 스텝이 상태를 알 수 없는 장치에서 모터를 열게
+되기 때문입니다. 스텝 사이에는 `CHAIN_PAUSE_S`(기본 5초) 동안 다음 스텝의 전류
+상한을 배너로 알리고 대기합니다.
+
+### 검증 스텝은 타이머가 아니라 목표로 끝난다
+
+모델 생성이 목적인 스텝은 모델이 만들어지면 더 할 일이 없습니다. 그래서 `LIVE`의
+시간은 **목표(goal)가 있는 스텝에서는 timeout**이고, 스텝은 목표가 충족되면
+끝납니다.
+
+| 스텝 | 목표 | timeout | 실측 소요 |
+|---|---|---|---|
+| step0 | 300 프레임, safe stop 없음 | 10 s | **3.0 s** |
+| step1 | stride 5개 분할 | 60 s | — |
+| step2 | 환자 모델 생성 | 90 s | — |
+| step3 | stride 10개 분석 + 게인 계산 | 180 s | **32.2 s** |
+| step4~6, feel | (없음) | 그 시간만큼 실행 | — |
+
+step4~6에 목표가 없는 이유: 목적이 **보조 상태에서의 보행 시간**이고, 당연해
+보이는 조건("착용자가 힘을 느꼴")은 요구할 수 없습니다 — 결핍이 없는 착용자는
+게인이 0에 가까운 것이 정상이므로, 그런 목표는 건강한 보행에서 체인을
+중단시킵니다.
+
+**timeout에 도달했는데 목표를 못 채운 스텝은 실패입니다.** 그 계층이 확인되지
+않았다는 뜻이고, 확인되지 않은 계층 위에서 모터를 여는 것이 등급 프로토콜이
+막으려는 바로 그 상황입니다.
+
+```
+[step2] GOAL NOT REACHED: patient model built - ran the full 6s timeout.
+        The layer is not confirmed; do not open the motor on it
+[abort] step2 did not finish cleanly; the rest of the chain (step4) was not run
+```
+
+구현은 `TwoLoopRuntime.run(..., until=predicate)` 입니다 — 매 사이클 1회 평가하고
+True면 종료합니다.
+
 `offline` 실행 결과물: `stride_log.csv`, `stride_table.csv`(모든 중간 계산값),
 `patient_model.json`, `results.png`(9개 패널).
 

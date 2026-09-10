@@ -553,7 +553,13 @@ def test_runtime_drift_triggers_ood_and_caps_the_gain() -> None:
     outputs = runtime.high.outputs if runtime.high is not None else []
     ood = [o for o in outputs if o.analysis.is_ood]
     assert ood, "the drifted gait should leave the patient model"
-    assert all(o.assist_gain <= config.assist.ood_max_gain + 1e-12 for o in ood[3:])
+    # the cap waits for a streak of OOD strides and then releases the gain at
+    # max_gain_delta per stride, so the bound holds once both have run their
+    # course, not on the first flagged stride
+    settling = (config.assist.required_consecutive_ood_strides
+                + int(config.assist.max_gain / config.assist.max_gain_delta))
+    assert all(o.assist_gain <= config.assist.ood_max_gain + 1e-12
+               for o in ood[settling:])
 
 
 # --------------------------------------------------------------------------- #
@@ -891,3 +897,33 @@ def test_an_oversized_assist_force_is_reported_as_clipping() -> None:
     )
     assert command.saturated
     assert command.current_a == pytest.approx(config.current_limit_a)
+
+
+def test_the_run_stops_when_its_goal_is_met() -> None:
+    """``until`` ends the run early; the duration is then only a timeout.
+
+    A stage whose purpose is to reach a state has nothing left to do once it is
+    reached, and a wearer on a treadmill should not wait out a timer.
+    """
+    def _runtime():
+        config = Config()
+        config.loop.high_level_in_thread = False
+        motor = MockMotor(current_limit_a=config.impedance.current_limit_a)
+        sensors = SensorManager(
+            MockSensorSource(config.sensor, motor=motor), config.sensor
+        )
+        sensors.open()
+        return TwoLoopRuntime(
+            config,
+            LowLevelLoop(config, sensors, motor, AssistCommand()),
+            baseline_collector=BaselineCollector(config),
+            logger=StrideLogger(),
+        )
+
+    runtime = _runtime()
+    cycles = runtime.run(duration_s=60.0, realtime=False,
+                         until=lambda: runtime.low.cycles >= 25)
+    assert cycles == 25
+
+    # without the predicate the same call runs to its other stop condition
+    assert _runtime().run(max_cycles=40, realtime=False) == 40

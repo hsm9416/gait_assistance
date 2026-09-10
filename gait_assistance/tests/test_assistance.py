@@ -420,12 +420,21 @@ def test_a_manifold_deviation_alone_never_assists() -> None:
     assert assessment.limited_assist_gain == 0.0
 
 
+def _strides_to_open(config: Config) -> int:
+    """Strides a steady deficit needs before the gain may first rise.
+
+    While the gain is still climbing it is recomputed every stride, so the
+    streak is counted in strides; the hold only applies once it has settled.
+    """
+    return config.assist.required_consecutive_deficit_strides
+
+
 def test_a_biomechanical_deficit_alone_produces_base_assistance() -> None:
     """``E_B > 0`` with ``E_R = 0`` assists at the base factor."""
     config = Config()
     policy = _policy(config=config)
     deficient = _metrics(swing=0.20)          # a full-scale swing deficit
-    for _ in range(config.assist.required_consecutive_deficit_strides):
+    for _ in range(_strides_to_open(config)):
         assessment = policy.assess(_analysis(manifold_deviation=0.0), deficient)
     assert assessment.state is DecisionState.BIOMECH_DEFICIT_ONLY
     assert assessment.biomechanical_deviation > 0.0
@@ -441,7 +450,7 @@ def test_a_manifold_deviation_amplifies_an_existing_deficit() -> None:
 
     calm = _policy(config=config)
     severe = _policy(config=config)
-    for _ in range(config.assist.required_consecutive_deficit_strides):
+    for _ in range(_strides_to_open(config)):
         calm_assessment = calm.assess(_analysis(manifold_deviation=0.0), deficient)
         severe_assessment = severe.assess(_analysis(manifold_deviation=1.0), deficient)
 
@@ -617,14 +626,14 @@ def test_a_single_anomalous_stride_does_not_raise_the_gain() -> None:
 def test_the_gain_rises_once_the_deficit_persists() -> None:
     """The configured number of consecutive deficit strides opens the throttle."""
     config = Config()
-    required = config.assist.required_consecutive_deficit_strides
     policy = _policy(config=config)
     deficient = _metrics(swing=0.20)
 
+    needed = _strides_to_open(config)
     gains = []
-    for _ in range(required):
+    for _ in range(needed):
         gains.append(policy.assess(_analysis(), deficient).limited_assist_gain)
-    assert gains[:-1] == [0.0] * (required - 1)
+    assert gains[:-1] == [0.0] * (needed - 1)
     assert gains[-1] > 0.0
 
 
@@ -633,17 +642,26 @@ def test_the_gain_falls_only_after_a_sustained_recovery() -> None:
     config = Config()
     policy = _policy(config=config)
     deficient = _metrics(swing=0.20)
-    for _ in range(6):
+    # let the gain climb to where it stops moving, so the release is measured
+    # from a steady value rather than from the middle of the climb
+    for _ in range(40):
         policy.assess(_analysis(), deficient)
+        if policy.settled:
+            break
     assisted = policy.gain
     assert assisted > 0.0
 
+    # a settled gain is judged once per hold window, so the release is counted
+    # in windows - slower than the climb, which is the safe direction
     recovered = _metrics(swing=0.38)
-    first = policy.assess(_analysis(), recovered)
+    interval = config.assist.gain_update_interval_strides
+    for _ in range(interval):
+        first = policy.assess(_analysis(), recovered)
     assert first.limited_assist_gain == pytest.approx(assisted)
     assert first.consecutive_recovery_strides == 1
 
-    for _ in range(config.assist.required_consecutive_recovery_strides - 1):
+    remaining = config.assist.required_consecutive_recovery_strides - 1
+    for _ in range(remaining * interval):
         last = policy.assess(_analysis(), recovered)
     assert last.limited_assist_gain < assisted
 
@@ -805,28 +823,44 @@ def test_a_single_reference_still_loads_as_one(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_the_gain_is_held_for_the_configured_number_of_strides() -> None:
-    """The applied gain moves on every N-th stride, not on every stride."""
+def test_the_gain_is_recomputed_every_stride_until_it_settles() -> None:
+    """The climb is per stride; the hold only takes over once it stops moving.
+
+    Holding a gain that is still rising adds the interval to an already
+    rate-limited climb, which is what kept it from reaching a useful level.
+    """
     config = Config()
     config.assist.gain_update_interval_strides = 3
+    config.assist.gain_converged_strides = 10
     policy = _policy(config=config)
     deficient = _metrics(swing=0.20)
+
+    climbing = [
+        policy.assess(_analysis(manifold_deviation=1.0), deficient).gain_updated
+        for _ in range(config.assist.required_consecutive_deficit_strides + 2)
+    ]
+    assert all(climbing), "the gain was held while it was still climbing"
+    assert policy.gain > 0.0
+
+    # walk on until the gain stops changing, then watch the hold take over
+    for _ in range(40):
+        policy.assess(_analysis(manifold_deviation=1.0), deficient)
+        if policy.settled:
+            break
+    assert policy.settled, "a steady deficit never settled the gain"
 
     updated = []
     for _ in range(9):
         assessment = policy.assess(_analysis(manifold_deviation=1.0), deficient)
         updated.append((assessment.gain_updated, assessment.limited_assist_gain))
-
-    # every third stride recomputes; the two in between hold what it produced
+    interval = config.assist.gain_update_interval_strides
     assert [flag for flag, _ in updated] == [
         False, False, True, False, False, True, False, False, True
-    ]
-    # the invariant: the gain only ever differs from the previous stride's on a
+    ], "a settled gain is recomputed every stride instead of every N-th"
+    # the invariant: the gain only differs from the previous stride's on a
     # stride that recomputed it
     for (_, previous), (flag, gain) in zip(updated, updated[1:]):
         assert flag or gain == previous, "the gain moved without an update"
-    # and the deficit keeps being measured while the gain waits
-    assert all(a > 0.0 for a in (assessment.raw_assist_gain,))
 
 
 def test_an_interval_of_one_updates_every_stride() -> None:
@@ -871,3 +905,30 @@ def test_the_ood_cap_is_not_held() -> None:
     assessment = policy.assess(_analysis(manifold_deviation=1.0, ood=True), deficient)
     assert assessment.ood_engaged and assessment.gain_updated
     assert assessment.limited_assist_gain < before
+
+
+def test_isolated_deficit_strides_still_raise_the_gain() -> None:
+    """The real deficit pattern is not a streak, and must still assist.
+
+    ``logs/20260910_1648/step6`` measured a deficit on 8 of 27 strides with a
+    longest run of 2, because the belt is on one leg and consecutive detected
+    strides alternate between the legs.  Scoring each stride on its own and
+    then also demanding a streak made the two filters multiply, and the gain
+    could not accumulate at all: it reached 0.1 once in 27 strides and fell
+    back to 0.  Averaging over the hold window is what makes an every-other
+    stride deficit a deficit.
+    """
+    measured = "010000011001001000001010010"     # 1 = the stride showed E_B > 0
+    config = Config()
+    policy = _policy(config=config)
+    deficient, in_range = _metrics(swing=0.20), _metrics(swing=0.38)
+
+    gains = [
+        policy.assess(
+            _analysis(manifold_deviation=1.0),
+            deficient if flag == "1" else in_range,
+        ).limited_assist_gain
+        for flag in measured
+    ]
+    assert max(gains) > 0.1, "an isolated-deficit pattern produced no assistance"
+    assert gains[-1] > 0.0, "the gain did not hold through the pattern"

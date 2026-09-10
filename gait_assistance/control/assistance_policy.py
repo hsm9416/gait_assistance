@@ -740,6 +740,8 @@ class AssistanceAssessment:
     #: baseline_healthy_distance - current: positive means the stride moved
     #: closer to the healthy region than the session started
     delta_healthy: float = float("nan")
+    #: consecutive gain-update windows that showed a deficit (a window is
+    #: ``gain_update_interval_strides`` strides, so 1 stride when that is 1)
     consecutive_deficit_strides: int = 0
     consecutive_recovery_strides: int = 0
     #: whether the OOD rule actually acted: ``ood`` repeated for
@@ -892,6 +894,11 @@ class AssistancePolicy:
         self.ood_streak = 0
         #: strides since the gain was last recomputed; see :meth:`_hold_elapsed`
         self.strides_since_gain_update = 0
+        #: raw gains of the last ``gain_update_interval_strides`` strides
+        self._window: List[float] = []
+        #: consecutive strides whose applied gain did not change
+        self.gain_repeat = 0
+        self._last_applied: Optional[float] = None
 
     @classmethod
     def from_model(
@@ -923,6 +930,9 @@ class AssistancePolicy:
         self.persistence.reset()
         self.ood_streak = 0
         self.strides_since_gain_update = 0
+        self._window = []
+        self.gain_repeat = 0
+        self._last_applied = None
 
     def assess(
         self,
@@ -960,10 +970,10 @@ class AssistancePolicy:
         )
         raw_gain = float(self.config.assist.max_gain * assist_score)
 
-        self.persistence.update(e_b > 0.0)
         gain = self._apply_gain(
             raw_gain, state=state, assist_allowed=assist_allowed, is_ood=ood_engaged
         )
+        self._track_settling(gain)
         return AssistanceAssessment(
             gait_state=None if analysis.gait_state < 0 else int(analysis.gait_state),
             gait_state_confidence=float(analysis.confidence),
@@ -1043,6 +1053,7 @@ class AssistancePolicy:
         if not assist_allowed:
             # a safety veto is never held: it de-energises on this stride
             self.strides_since_gain_update = 0
+            self._window.clear()
             return self.gain_policy.update(0.0, assist_allowed=False)
 
         if is_ood:
@@ -1060,6 +1071,7 @@ class AssistancePolicy:
             # the cap is a refusal to assist into gait the model lost, so it
             # acts on the stride it engages on rather than waiting out the hold
             self.strides_since_gain_update = 0
+            self._window.clear()
             return self.gain_policy.update(score, is_ood=True, assist_allowed=True)
 
         if state is DecisionState.MANIFOLD_DEVIATION_ONLY:
@@ -1068,22 +1080,72 @@ class AssistancePolicy:
             # decides only how quickly the previous gain is released.
             raw_gain = 0.0
 
-        if not self._hold_elapsed():
+        # The decision unit is a rolling window of the last few strides, not a
+        # single stride.  Measured deficits arrive on isolated strides
+        # (logs/20260910_1648/step6: pattern 010000011001001000001010010, 8 of
+        # 27 strides, longest run 2) because the belt is on one leg while
+        # consecutive detected strides alternate between the legs.  Scoring one
+        # stride at a time and then also demanding a streak of them made the
+        # two filters multiply and the gain could not accumulate at all.
+        #
+        # The window is reduced with max(), not mean(): a stride with no
+        # deficit in this pattern is the *contralateral* leg, which is not a
+        # measurement of the assisted leg at all, so averaging it in halves a
+        # deficit that is really there (measured on the pattern above: 0.055
+        # with mean, 0.166 with max).
+        self._remember(raw_gain)
+        if self.settled and not self._hold_elapsed():
             return self.gain_policy.gain
+        # while the gain is still climbing it is recomputed every stride: the
+        # rise is already rate limited, and adding the hold on top of that is
+        # what made it too slow to reach a useful level
+        self.strides_since_gain_update = 0
+        windowed = max(self._window) if self._window else 0.0
 
-        target = self.persistence.allow(raw_gain, self.gain_policy.gain)
+        self.persistence.update(windowed > 0.0)
+        target = self.persistence.allow(windowed, self.gain_policy.gain)
         score = target / cfg.max_gain if cfg.max_gain > 0.0 else 0.0
         return self.gain_policy.update(score, is_ood=False, assist_allowed=True)
+
+    @property
+    def settled(self) -> bool:
+        """Whether the gain has stopped moving, so the hold may take over.
+
+        Returns:
+            True once the applied gain has been unchanged for
+            ``assist.gain_converged_strides`` strides.
+        """
+        return self.gain_repeat >= max(
+            int(self.config.assist.gain_converged_strides), 1
+        )
+
+    def _remember(self, raw_gain: float) -> None:
+        """Keep the raw gain of the last ``gain_update_interval_strides`` strides."""
+        span = max(int(self.config.assist.gain_update_interval_strides), 1)
+        self._window.append(float(raw_gain))
+        del self._window[:-span]
+
+    def _track_settling(self, gain: float) -> None:
+        """Count how long the applied gain has been standing still.
+
+        Args:
+            gain: the gain applied on this stride.
+        """
+        if self._last_applied is not None and abs(gain - self._last_applied) <= 1e-12:
+            self.gain_repeat += 1
+        else:
+            self.gain_repeat = 0
+        self._last_applied = gain
 
     def _hold_elapsed(self) -> bool:
         """Whether this stride may move the gain, or has to hold it.
 
-        One gain is kept for ``gain_update_interval_strides`` strides.  The
-        assistance changes the gait the deficit is measured from, so a gain
-        recomputed every stride closes that loop at stride rate with nothing
-        settled in between, and the wearer feels a different pull on every
-        step.  The deficit is still computed and logged on every stride - only
-        the applied gain waits.
+        Only consulted once the gain has settled: one settled gain is then kept
+        for ``gain_update_interval_strides`` strides, because the assistance
+        changes the gait the deficit is measured from and a settled value
+        recomputed every stride would jitter the pull from step to step.  The
+        deficit is still computed and logged on every stride - only the applied
+        gain waits.
 
         Returns:
             True when the interval has elapsed; the counter then restarts.
@@ -1109,6 +1171,7 @@ class AssistancePolicy:
     ) -> AssistanceAssessment:
         """Assessment of a stride that could not be represented at all."""
         gain = self.gain_policy.update(0.0, assist_allowed=False)
+        self._track_settling(gain)
         return AssistanceAssessment(
             gait_state=None,
             gait_state_confidence=0.0,

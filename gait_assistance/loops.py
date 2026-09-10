@@ -585,6 +585,7 @@ class TwoLoopRuntime:
         max_cycles: Optional[int] = None,
         on_cycle: Optional[Callable[[LowLevelOutput], None]] = None,
         realtime: bool = True,
+        until: Optional[Callable[[], bool]] = None,
     ) -> int:
         """Run the low-level loop, dispatching strides as they complete.
 
@@ -594,6 +595,11 @@ class TwoLoopRuntime:
             max_cycles: maximum number of control cycles.
             on_cycle: callback invoked with every :class:`LowLevelOutput`.
             realtime: pace the loop at ``config.loop.low_level_hz``.
+            until: goal predicate, polled once per cycle.  When it returns True
+                the run stops: a stage whose purpose is to build the model has
+                nothing left to do once the model exists, and standing on a
+                treadmill waiting out a timer is not free.  ``duration_s`` is
+                then a timeout rather than the target.
 
         Returns:
             The number of executed control cycles.
@@ -623,6 +629,8 @@ class TwoLoopRuntime:
                     self.states.safe_stop()
                 if on_cycle is not None:
                     on_cycle(output)
+                if until is not None and until():
+                    break
                 if realtime:
                     pacer.sleep()
         finally:
