@@ -458,15 +458,38 @@ def test_a_manifold_deviation_amplifies_an_existing_deficit() -> None:
     assert deficient_score > 0.0
 
 
+def _establish_gain(policy, deficient, above: float = 0.0, strides: int = 40) -> float:
+    """Walk deficient strides until the gain settles, and return it.
+
+    One gain is held for ``gain_update_interval_strides`` strides and then may
+    move by ``max_gain_delta``, so reaching a given level takes several strides
+    rather than one.
+
+    Args:
+        policy: the policy to drive.
+        deficient: metrics of a stride showing a deficit.
+        above: level the resulting gain has to exceed for the caller's test to
+            mean anything.
+        strides: how many strides to walk at most.
+
+    Returns:
+        The established gain.
+    """
+    for _ in range(strides):
+        policy.assess(_analysis(manifold_deviation=1.0), deficient)
+        if policy.gain > above:
+            break
+    assert policy.gain > above
+    return policy.gain
+
+
 def test_an_out_of_distribution_stride_refuses_aggressive_assistance() -> None:
     """OOD holds the gain instead of acting on a model that does not apply."""
     config = Config()
     policy = _policy(config=config)
     deficient = _metrics(swing=0.20)
-    for _ in range(config.assist.required_consecutive_deficit_strides):
-        policy.assess(_analysis(manifold_deviation=1.0), deficient)
-    established = policy.gain
-    assert established > 0.0
+    # the cap can only be seen to bite from a gain above it
+    _establish_gain(policy, deficient, above=config.assist.ood_max_gain)
 
     # the rule waits for a streak: the strides before it still follow the
     # deficit path, so the gain may well keep rising through them
@@ -498,9 +521,9 @@ def test_the_safe_minimum_ood_policy_falls_back_instead_of_holding() -> None:
     config.assist.ood_safe_gain = 0.0
     policy = _policy(config=config)
     deficient = _metrics(swing=0.20)
-    for _ in range(6):
-        policy.assess(_analysis(manifold_deviation=1.0), deficient)
-    established = policy.gain
+    established = _establish_gain(
+        policy, deficient, above=config.assist.ood_max_gain
+    )
 
     for _ in range(config.assist.required_consecutive_ood_strides):
         assessment = policy.assess(
@@ -520,9 +543,7 @@ def test_a_single_out_of_distribution_stride_does_not_cap_the_gain() -> None:
     assert config.assist.required_consecutive_ood_strides > 1
     policy = _policy(config=config)
     deficient = _metrics(swing=0.20)
-    for _ in range(config.assist.required_consecutive_deficit_strides):
-        policy.assess(_analysis(manifold_deviation=1.0), deficient)
-    established = policy.gain
+    established = _establish_gain(policy, deficient)
 
     assessment = policy.assess(_analysis(manifold_deviation=1.0, ood=True), deficient)
     assert assessment.ood and not assessment.ood_engaged
@@ -777,3 +798,76 @@ def test_a_single_reference_still_loads_as_one(tmp_path: Path) -> None:
     loaded = load_reference(path)
     assert isinstance(loaded, HealthyReference)
     assert loaded.metric_ranges["belt_excursion"].lower == 118.0
+
+
+# --------------------------------------------------------------------------- #
+# one gain per several strides
+# --------------------------------------------------------------------------- #
+
+
+def test_the_gain_is_held_for_the_configured_number_of_strides() -> None:
+    """The applied gain moves on every N-th stride, not on every stride."""
+    config = Config()
+    config.assist.gain_update_interval_strides = 3
+    policy = _policy(config=config)
+    deficient = _metrics(swing=0.20)
+
+    updated = []
+    for _ in range(9):
+        assessment = policy.assess(_analysis(manifold_deviation=1.0), deficient)
+        updated.append((assessment.gain_updated, assessment.limited_assist_gain))
+
+    # every third stride recomputes; the two in between hold what it produced
+    assert [flag for flag, _ in updated] == [
+        False, False, True, False, False, True, False, False, True
+    ]
+    # the invariant: the gain only ever differs from the previous stride's on a
+    # stride that recomputed it
+    for (_, previous), (flag, gain) in zip(updated, updated[1:]):
+        assert flag or gain == previous, "the gain moved without an update"
+    # and the deficit keeps being measured while the gain waits
+    assert all(a > 0.0 for a in (assessment.raw_assist_gain,))
+
+
+def test_an_interval_of_one_updates_every_stride() -> None:
+    """``1`` restores the per-stride behaviour the interval replaced."""
+    config = Config()
+    config.assist.gain_update_interval_strides = 1
+    policy = _policy(config=config)
+    deficient = _metrics(swing=0.20)
+    flags = [
+        policy.assess(_analysis(manifold_deviation=1.0), deficient).gain_updated
+        for _ in range(4)
+    ]
+    assert flags == [True, True, True, True]
+
+
+def test_a_safety_veto_is_not_held() -> None:
+    """The veto de-energises on its own stride, whatever the hold says."""
+    config = Config()
+    config.assist.gain_update_interval_strides = 5
+    policy = _policy(config=config)
+    deficient = _metrics(swing=0.20)
+    _establish_gain(policy, deficient)
+
+    assessment = policy.assess(
+        _analysis(manifold_deviation=1.0), deficient, assist_allowed=False
+    )
+    assert assessment.limited_assist_gain == 0.0
+    assert assessment.gain_updated
+
+
+def test_the_ood_cap_is_not_held() -> None:
+    """The OOD cap acts on the stride it engages on, not at the next update."""
+    config = Config()
+    config.assist.gain_update_interval_strides = 5
+    policy = _policy(config=config)
+    deficient = _metrics(swing=0.20)
+    _establish_gain(policy, deficient, above=config.assist.ood_max_gain)
+
+    for _ in range(config.assist.required_consecutive_ood_strides - 1):
+        policy.assess(_analysis(manifold_deviation=1.0, ood=True), deficient)
+    before = policy.gain
+    assessment = policy.assess(_analysis(manifold_deviation=1.0, ood=True), deficient)
+    assert assessment.ood_engaged and assessment.gain_updated
+    assert assessment.limited_assist_gain < before

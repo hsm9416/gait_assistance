@@ -59,6 +59,7 @@ STRIDE_LOG_COLUMNS: List[str] = [
 
     "raw_assist_gain",
     "assist_gain",
+    "gain_updated",
     "target_belt_length",
     "motor_position",
     "motor_velocity",
@@ -119,6 +120,7 @@ class StrideLogRecord:
 
     raw_assist_gain: float = float("nan")
     assist_gain: float = float("nan")
+    gain_updated: int = 1
     target_belt_length: float = float("nan")
     motor_position: float = float("nan")
     motor_velocity: float = float("nan")

@@ -457,6 +457,14 @@ class AssistConfig:
     #: policy against single-stride noise; works together with the rate limit.
     required_consecutive_deficit_strides: int = 3
     required_consecutive_recovery_strides: int = 3
+    #: how many strides one gain is held for.  The assistance changes the gait
+    #: it is measured from, so recomputing every stride closes that loop at
+    #: stride rate with no settling time, and the wearer feels a pull that
+    #: differs on every step.  The gain is therefore recomputed every N-th
+    #: stride and held in between; ``1`` restores per-stride updates.  A
+    #: safety veto and the OOD cap are never held - only a rise or a normal
+    #: release waits for the interval.
+    gain_update_interval_strides: int = 3
     profile: str = "sine"             #: "sine" | "raised_cosine" | "trapezoid"
     max_retraction_mm: float = 30.0
     #: expected swing duration used to interpolate the profile before the first

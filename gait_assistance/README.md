@@ -238,6 +238,31 @@ rate limit(`max_gain_delta`)과 함께 작동하지만 역할이 다릅니다. r
 게인이 *얼마나 빨리* 움직일 수 있는지를, persistence gate는 *움직여도 되는지*를
 결정합니다.
 
+### 하나의 게인을 여러 stride 동안 유지한다
+
+```python
+gain_update_interval_strides = 3    # 3 stride마다 한 번만 게인 재계산
+```
+
+보조는 **자신이 측정하는 보행을 바꿉니다.** 매 stride 게인을 다시 계산하면 그
+되먹임 고리가 stride 주기로 돌아가 정착할 시간이 없고, 착용자는 걸음마다 다른
+당김을 느낍니다. 그래서 게인은 N stride마다 한 번 계산하고 그 사이에는
+**유지**합니다. 결핍(E_B·E_R·raw_gain)은 **매 stride 계속 계산·기록**되며,
+유지된 것은 적용 게인뿐입니다. `gain_updated` 컬럼이 그 stride가 게인을
+재계산했는지 기록합니다.
+
+유지되지 않고 **즉시 작동하는 예외 두 가지**:
+
+| 상황 | 동작 |
+|---|---|
+| safety veto (`assist_allowed = False`) | 그 stride에서 즉시 0 |
+| OOD 캡 발동 | 발동한 stride에서 즉시 캡 적용 |
+
+`1`로 두면 이전의 매 stride 갱신 동작입니다. 실측(0.4 m/s 녹화 13 strides):
+`interval=1`은 게인이 4회 변했고, `interval=3`은 2회 변했으며 재계산은 4 stride에서만
+일어났습니다. rate limit이 갱신 1회당 적용되므로 **상승 속도는 1/N로 느려집니다**
+— 더 빠른 상승이 필요하면 `max_gain_delta`를 키우십시오.
+
 ## 세션 중 변화 추적
 
 `d_patient`는 보조 트리거의 주 기준이 아니라 **추세 지표**입니다. 세션 중 환자

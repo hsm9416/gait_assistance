@@ -255,6 +255,9 @@ class HighLevelLoop:
                 float("nan") if assessment is None else assessment.raw_assist_gain
             ),
             assist_gain=output.assist_gain,
+            gain_updated=(
+                1 if assessment is None else int(assessment.gain_updated)
+            ),
             target_belt_length=target_belt,
             motor_position=last.motor_position if last else float("nan"),
             motor_velocity=last.motor_velocity if last else float("nan"),

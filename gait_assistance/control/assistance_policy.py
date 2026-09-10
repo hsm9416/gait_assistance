@@ -746,6 +746,8 @@ class AssistanceAssessment:
     #: ``required_consecutive_ood_strides`` strides in a row
     ood_engaged: bool = False
     consecutive_ood_strides: int = 0
+    #: whether this stride recomputed the gain or held the previous one
+    gain_updated: bool = True
     metrics: Optional[GaitMetrics] = None
     valid: bool = True
     message: str = ""
@@ -763,6 +765,7 @@ class AssistanceAssessment:
             "ood": int(self.ood),
             "ood_engaged": int(self.ood_engaged),
             "consecutive_ood_strides": self.consecutive_ood_strides,
+            "gain_updated": int(self.gain_updated),
             "d_patient": self.d_patient,
             "d_healthy": self.d_healthy,
             "healthy_region_threshold": self.healthy_region_threshold,
@@ -887,6 +890,8 @@ class AssistancePolicy:
         self.persistence = persistence or PersistenceGate(self.config.assist)
         self.baseline_healthy_distance = float(baseline_healthy_distance)
         self.ood_streak = 0
+        #: strides since the gain was last recomputed; see :meth:`_hold_elapsed`
+        self.strides_since_gain_update = 0
 
     @classmethod
     def from_model(
@@ -917,6 +922,7 @@ class AssistancePolicy:
         self.gain_policy.reset(0.0)
         self.persistence.reset()
         self.ood_streak = 0
+        self.strides_since_gain_update = 0
 
     def assess(
         self,
@@ -981,6 +987,7 @@ class AssistancePolicy:
             consecutive_recovery_strides=self.persistence.recovery_streak,
             ood_engaged=ood_engaged,
             consecutive_ood_strides=self.ood_streak,
+            gain_updated=self.strides_since_gain_update == 0,
             metrics=stride_metrics,
             valid=True,
         )
@@ -1034,6 +1041,8 @@ class AssistancePolicy:
         """Send the raw gain through the OOD rule, the gate and the rate limit."""
         cfg = self.config.assist
         if not assist_allowed:
+            # a safety veto is never held: it de-energises on this stride
+            self.strides_since_gain_update = 0
             return self.gain_policy.update(0.0, assist_allowed=False)
 
         if is_ood:
@@ -1048,6 +1057,9 @@ class AssistancePolicy:
             )
             target = min(held, cfg.ood_max_gain)
             score = target / cfg.max_gain if cfg.max_gain > 0.0 else 0.0
+            # the cap is a refusal to assist into gait the model lost, so it
+            # acts on the stride it engages on rather than waiting out the hold
+            self.strides_since_gain_update = 0
             return self.gain_policy.update(score, is_ood=True, assist_allowed=True)
 
         if state is DecisionState.MANIFOLD_DEVIATION_ONLY:
@@ -1056,9 +1068,32 @@ class AssistancePolicy:
             # decides only how quickly the previous gain is released.
             raw_gain = 0.0
 
+        if not self._hold_elapsed():
+            return self.gain_policy.gain
+
         target = self.persistence.allow(raw_gain, self.gain_policy.gain)
         score = target / cfg.max_gain if cfg.max_gain > 0.0 else 0.0
         return self.gain_policy.update(score, is_ood=False, assist_allowed=True)
+
+    def _hold_elapsed(self) -> bool:
+        """Whether this stride may move the gain, or has to hold it.
+
+        One gain is kept for ``gain_update_interval_strides`` strides.  The
+        assistance changes the gait the deficit is measured from, so a gain
+        recomputed every stride closes that loop at stride rate with nothing
+        settled in between, and the wearer feels a different pull on every
+        step.  The deficit is still computed and logged on every stride - only
+        the applied gain waits.
+
+        Returns:
+            True when the interval has elapsed; the counter then restarts.
+        """
+        interval = max(int(self.config.assist.gain_update_interval_strides), 1)
+        self.strides_since_gain_update += 1
+        if self.strides_since_gain_update < interval:
+            return False
+        self.strides_since_gain_update = 0
+        return True
 
     def _delta_healthy(self, d_healthy: float) -> float:
         """Improvement in healthy-region distance since the session baseline."""
