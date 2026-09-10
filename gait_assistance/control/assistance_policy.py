@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -49,7 +49,12 @@ from ..gait.feature_extractor import (
     StrideMetrics,
     collect_metric_samples,
 )
-from ..manifold.reference import HealthyReference, MetricRange, build_metric_ranges
+from ..manifold.reference import (
+    HealthyReference,
+    MetricRange,
+    ReferenceBank,
+    build_metric_ranges,
+)
 from ..patient.patient_model import PatientModel, StrideAnalysis
 
 
@@ -328,9 +333,15 @@ class AssistanceGainPolicy:
         cfg = self.config
         if not np.isfinite(score):
             score = 0.0
-        target = float(np.clip(score, 0.0, 1.0)) * cfg.max_gain
-        if is_ood:
-            target = min(target, cfg.ood_max_gain)
+        if cfg.fixed_gain > 0.0:
+            # Bring-up override: hold the gain so the force is deterministic.
+            # The safety veto below still applies, and the current limit still
+            # caps what reaches the motor.
+            target = float(np.clip(cfg.fixed_gain, 0.0, cfg.max_gain))
+        else:
+            target = float(np.clip(score, 0.0, 1.0)) * cfg.max_gain
+            if is_ood:
+                target = min(target, cfg.ood_max_gain)
         if not assist_allowed:
             target = 0.0
         delta = float(np.clip(target - self._gain, -cfg.max_gain_delta, cfg.max_gain_delta))
@@ -508,16 +519,20 @@ class BiomechanicalEvaluator:
         config: Optional[DeviationConfig] = None,
         metric_ranges: Optional[Mapping[str, MetricRange]] = None,
         reference_source: str = SOURCE_BASELINE,
+        bank: Optional[ReferenceBank] = None,
     ) -> None:
         self.config = config or DeviationConfig()
         self.metric_ranges: Dict[str, MetricRange] = dict(metric_ranges or {})
         self.reference_source = reference_source
+        #: when set, the stride's own cadence picks the intervals it is scored
+        #: against, instead of one recording's speed standing in for all of them
+        self.bank = bank
 
     @classmethod
     def from_reference(
         cls,
         config: Optional[DeviationConfig],
-        healthy: Optional[HealthyReference] = None,
+        healthy: Optional[Union[HealthyReference, ReferenceBank]] = None,
         baseline_metrics: Optional[Sequence[GaitMetrics]] = None,
         reference_config: Optional[ReferenceConfig] = None,
     ) -> "BiomechanicalEvaluator":
@@ -537,6 +552,12 @@ class BiomechanicalEvaluator:
         Returns:
             The evaluator.
         """
+        if isinstance(healthy, ReferenceBank):
+            # the slowest reference is the opening choice; evaluate() reselects
+            # per stride, and a missing cadence must not score against a fast
+            # reference because that is what invents a deficit
+            opening = healthy.reference(None)
+            return cls(config, opening.metric_ranges, SOURCE_HEALTHY, bank=healthy)
         if healthy is not None and healthy.metric_ranges:
             return cls(config, healthy.metric_ranges, SOURCE_HEALTHY)
         if baseline_metrics:
@@ -549,8 +570,31 @@ class BiomechanicalEvaluator:
         """Configured weight of one device-actionable term."""
         return float(self.config.biomech_weights.get(term, 0.0))
 
+    def ranges_for(
+        self, metrics: Optional[GaitMetrics]
+    ) -> Tuple[Mapping[str, MetricRange], str]:
+        """Reference intervals this stride must be compared against.
+
+        Args:
+            metrics: the stride's metrics; its ``stride_time`` selects the
+                cadence when a bank is loaded.
+
+        Returns:
+            ``(intervals, source)``.  The source carries the selected label, so
+            the log says which cadence scored the stride rather than leaving
+            the reader to guess.
+        """
+        if self.bank is None or metrics is None:
+            return self.metric_ranges, self.reference_source
+        label = self.bank.select(getattr(metrics, "stride_time", None))
+        return self.bank.references[label].metric_ranges, f"{self.reference_source}:{label}"
+
     def term_error(
-        self, term: str, metrics: Optional[GaitMetrics], walking_speed: Optional[float] = None
+        self,
+        term: str,
+        metrics: Optional[GaitMetrics],
+        walking_speed: Optional[float] = None,
+        ranges: Optional[Mapping[str, MetricRange]] = None,
     ) -> Optional[float]:
         """Normalised error of one device-actionable term.
 
@@ -569,7 +613,7 @@ class BiomechanicalEvaluator:
         if field_name is None:
             return None
         value = getattr(metrics, field_name, None)
-        metric_range = self._range_for(field_name, walking_speed)
+        metric_range = self._range_for(field_name, walking_speed, ranges)
         return interval_error(
             value,
             metric_range,
@@ -594,8 +638,9 @@ class BiomechanicalEvaluator:
         Returns:
             The :class:`BiomechanicalDeficit`.
         """
+        ranges, source = self.ranges_for(metrics)
         errors: Dict[str, Optional[float]] = {
-            term: self.term_error(term, metrics, walking_speed)
+            term: self.term_error(term, metrics, walking_speed, ranges)
             for term in TERM_DIRECTIONS
         }
         total = 0.0
@@ -613,18 +658,26 @@ class BiomechanicalEvaluator:
             temporal_symmetry_error=errors["temporal_symmetry"],
             trunk_error=errors["trunk_compensation"],
             score=float(np.clip(total, 0.0, 1.0)),
-            reference_source=self.reference_source,
+            reference_source=source,
             undefined_terms=tuple(undefined),
         )
 
     # -- internals ---------------------------------------------------------- #
 
     def _range_for(
-        self, field_name: str, walking_speed: Optional[float]
+        self,
+        field_name: str,
+        walking_speed: Optional[float],
+        ranges: Optional[Mapping[str, MetricRange]] = None,
     ) -> Optional[MetricRange]:
-        """Reference interval of one metric field."""
-        del walking_speed  # the current reference is not speed conditioned
-        return self.metric_ranges.get(field_name)
+        """Reference interval of one metric field.
+
+        The cadence already selected the interval set in :meth:`ranges_for`;
+        ``walking_speed`` stays in the signature because a ground-speed sensor
+        would condition on speed directly, which the belt cannot measure.
+        """
+        del walking_speed
+        return (self.metric_ranges if ranges is None else ranges).get(field_name)
 
     def _scale_for(self, term: str, metric_range: Optional[MetricRange]) -> float:
         """Saturation scale of one term, from config or from the interval."""
@@ -655,6 +708,7 @@ class AssistanceAssessment:
 
     gait_state: Optional[int]
     gait_state_confidence: float
+    #: this stride's raw out-of-distribution flag
     ood: bool
 
     #: baseline deviation: distance to the patient's own opening strides
@@ -688,6 +742,10 @@ class AssistanceAssessment:
     delta_healthy: float = float("nan")
     consecutive_deficit_strides: int = 0
     consecutive_recovery_strides: int = 0
+    #: whether the OOD rule actually acted: ``ood`` repeated for
+    #: ``required_consecutive_ood_strides`` strides in a row
+    ood_engaged: bool = False
+    consecutive_ood_strides: int = 0
     metrics: Optional[GaitMetrics] = None
     valid: bool = True
     message: str = ""
@@ -703,6 +761,8 @@ class AssistanceAssessment:
             "gait_state": self.gait_state,
             "cluster_confidence": self.gait_state_confidence,
             "ood": int(self.ood),
+            "ood_engaged": int(self.ood_engaged),
+            "consecutive_ood_strides": self.consecutive_ood_strides,
             "d_patient": self.d_patient,
             "d_healthy": self.d_healthy,
             "healthy_region_threshold": self.healthy_region_threshold,
@@ -826,6 +886,7 @@ class AssistancePolicy:
         self.gain_policy = gain_policy or AssistanceGainPolicy(self.config.assist)
         self.persistence = persistence or PersistenceGate(self.config.assist)
         self.baseline_healthy_distance = float(baseline_healthy_distance)
+        self.ood_streak = 0
 
     @classmethod
     def from_model(
@@ -834,7 +895,7 @@ class AssistancePolicy:
         """Build a policy calibrated against a fitted patient model."""
         evaluator = BiomechanicalEvaluator.from_reference(
             config.deviation,
-            healthy=model.healthy,
+            healthy=model.bank or model.healthy,
             baseline_metrics=model.baseline.metrics,
             reference_config=config.reference,
         )
@@ -855,6 +916,7 @@ class AssistancePolicy:
         """Return the policy to its initial state."""
         self.gain_policy.reset(0.0)
         self.persistence.reset()
+        self.ood_streak = 0
 
     def assess(
         self,
@@ -883,7 +945,8 @@ class AssistancePolicy:
         deficit = self.evaluator.evaluate(stride_metrics, walking_speed)
         e_b = deficit.score
         e_r = float(np.clip(analysis.manifold_deviation, 0.0, 1.0))
-        state = self._decision_state(e_r, e_b, analysis.is_ood)
+        ood_engaged = self._update_ood_streak(analysis.is_ood)
+        state = self._decision_state(e_r, e_b, ood_engaged)
 
         cfg = self.config.deviation
         assist_score = float(
@@ -893,7 +956,7 @@ class AssistancePolicy:
 
         self.persistence.update(e_b > 0.0)
         gain = self._apply_gain(
-            raw_gain, state=state, assist_allowed=assist_allowed, is_ood=analysis.is_ood
+            raw_gain, state=state, assist_allowed=assist_allowed, is_ood=ood_engaged
         )
         return AssistanceAssessment(
             gait_state=None if analysis.gait_state < 0 else int(analysis.gait_state),
@@ -916,11 +979,32 @@ class AssistancePolicy:
             delta_healthy=self._delta_healthy(analysis.d_healthy),
             consecutive_deficit_strides=self.persistence.deficit_streak,
             consecutive_recovery_strides=self.persistence.recovery_streak,
+            ood_engaged=ood_engaged,
+            consecutive_ood_strides=self.ood_streak,
             metrics=stride_metrics,
             valid=True,
         )
 
     # -- internals ---------------------------------------------------------- #
+
+    def _update_ood_streak(self, is_ood: bool) -> bool:
+        """Count consecutive OOD strides and report whether the cap engages.
+
+        The cap exists for gait the patient model has stopped recognising, not
+        for the single odd stride a mis-segmented step produces, so it waits
+        for a streak.  Until the streak is long enough the stride is still
+        logged as OOD but the gain follows the normal deficit path.
+
+        Args:
+            is_ood: this stride's raw out-of-distribution flag.
+
+        Returns:
+            True once the streak has reached
+            ``assist.required_consecutive_ood_strides``.
+        """
+        self.ood_streak = self.ood_streak + 1 if is_ood else 0
+        required = max(int(self.config.assist.required_consecutive_ood_strides), 1)
+        return self.ood_streak >= required
 
     @staticmethod
     def _decision_state(e_r: float, e_b: float, is_ood: bool) -> DecisionState:

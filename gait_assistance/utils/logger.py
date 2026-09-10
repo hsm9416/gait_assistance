@@ -22,6 +22,7 @@ STRIDE_LOG_COLUMNS: List[str] = [
     "gait_cluster",
     "cluster_confidence",
     "ood",
+    "ood_engaged",
 
     "d_patient",
     "d_healthy",
@@ -81,6 +82,7 @@ class StrideLogRecord:
     gait_cluster: Optional[str] = None
     cluster_confidence: float = float("nan")
     ood: int = 0
+    ood_engaged: int = 0
 
     d_patient: float = float("nan")
     d_healthy: float = float("nan")

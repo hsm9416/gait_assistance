@@ -206,6 +206,9 @@ class HighLevelLoop:
             gait_cluster=analysis.state_label,
             cluster_confidence=round(analysis.confidence, 6),
             ood=int(analysis.is_ood),
+            ood_engaged=(
+                0 if assessment is None else int(assessment.ood_engaged)
+            ),
 
             d_patient=analysis.d_patient,
             d_healthy=analysis.d_healthy,
@@ -316,6 +319,8 @@ class LowLevelLoop:
         self.rate = RateMonitor()
         self.last_output: Optional[LowLevelOutput] = None
         self.cycles = 0
+        #: shutdown problems worth reporting; see :meth:`stop`
+        self.stop_errors: List[str] = []
 
     def step(self) -> Optional[LowLevelOutput]:
         """Execute one control cycle.
@@ -370,6 +375,9 @@ class LowLevelLoop:
                 sample.belt_length,
                 target_velocity=0.0,
                 measured_velocity=sample.belt_velocity,
+                # the high level already decided how much to assist; the swing
+                # profile says where inside the swing it belongs
+                assist_fraction=target.assist_gain * target.profile_value,
             )
         else:
             command = self.impedance.zero_command()
@@ -385,9 +393,20 @@ class LowLevelLoop:
         return output
 
     def stop(self) -> None:
-        """Command zero current to the motor."""
-        if self.motor is not None:
+        """Command zero current to the motor.
+
+        A link that died mid-run cannot carry the command.  That matters - the
+        device is on a wearer and may still be energised - but raising here
+        would abandon the rest of the shutdown (the open log files, the serial
+        port), so the failure is recorded in :attr:`stop_errors` for the caller
+        to report instead.
+        """
+        if self.motor is None:
+            return
+        try:
             self.motor.stop()
+        except Exception as exc:           # a dead link, typically OSError
+            self.stop_errors.append(f"not confirmed at 0 A: {exc}")
 
 
 
@@ -497,7 +516,13 @@ class TwoLoopRuntime:
         self.low.assist.publish(
             output.assist_gain, output.baseline_belt_length, output.stride_id
         )
-        if output.analysis.is_ood:
+        # the state follows the engaged OOD rule, not the raw flag, so the
+        # machine does not visit OOD for a single mis-segmented stride
+        assessment = output.assessment
+        ood = (
+            output.analysis.is_ood if assessment is None else assessment.ood_engaged
+        )
+        if ood:
             if self.states.can_transition(SystemState.OOD):
                 self.states.transition_to(SystemState.OOD)
         elif self.states.state in (SystemState.OOD, SystemState.READY):

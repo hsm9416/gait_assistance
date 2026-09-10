@@ -8,6 +8,7 @@ on its own.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -44,6 +45,8 @@ from gait_assistance.manifold.log_euclidean import matrix_log
 from gait_assistance.manifold.reference import (
     HealthyReference,
     MetricRange,
+    ReferenceBank,
+    load_reference,
     build_healthy_reference,
     build_metric_ranges,
     distance_threshold,
@@ -323,7 +326,7 @@ def test_swing_stance_ratio_is_the_quotient_of_the_two_times() -> None:
     assert metrics.swing_stance_ratio == pytest.approx(swing_stance_ratio(stride))
     # The metrics name the detector that actually labelled the phases, so a
     # later run with the real detector is distinguishable in the same log.
-    assert metrics.phase_source == "scheduled"
+    assert metrics.phase_source == "belt_cycle"
 
 
 def test_metric_samples_skip_what_was_not_measured() -> None:
@@ -465,12 +468,26 @@ def test_an_out_of_distribution_stride_refuses_aggressive_assistance() -> None:
     established = policy.gain
     assert established > 0.0
 
+    # the rule waits for a streak: the strides before it still follow the
+    # deficit path, so the gain may well keep rising through them
+    for _ in range(config.assist.required_consecutive_ood_strides - 1):
+        tolerated = policy.assess(
+            _analysis(manifold_deviation=1.0, ood=True), deficient
+        )
+        assert tolerated.ood and not tolerated.ood_engaged
+    before = policy.gain
+
     assessment = policy.assess(_analysis(manifold_deviation=1.0, ood=True), deficient)
     assert assessment.state is DecisionState.OOD
-    assert assessment.ood
+    assert assessment.ood and assessment.ood_engaged
     # The raw score still says "assist harder"; the OOD rule refuses to.
     assert assessment.raw_assist_gain > 0.0
-    assert assessment.limited_assist_gain <= established + 1e-12
+    assert assessment.limited_assist_gain < before
+    # and it keeps releasing until the cap is reached, not part of the way
+    for _ in range(10):
+        assessment = policy.assess(
+            _analysis(manifold_deviation=1.0, ood=True), deficient
+        )
     assert assessment.limited_assist_gain <= config.assist.ood_max_gain + 1e-12
 
 
@@ -485,8 +502,36 @@ def test_the_safe_minimum_ood_policy_falls_back_instead_of_holding() -> None:
         policy.assess(_analysis(manifold_deviation=1.0), deficient)
     established = policy.gain
 
-    assessment = policy.assess(_analysis(manifold_deviation=1.0, ood=True), deficient)
+    for _ in range(config.assist.required_consecutive_ood_strides):
+        assessment = policy.assess(
+            _analysis(manifold_deviation=1.0, ood=True), deficient
+        )
+    assert assessment.ood_engaged
     assert assessment.limited_assist_gain < established
+
+
+def test_a_single_out_of_distribution_stride_does_not_cap_the_gain() -> None:
+    """An isolated OOD stride is recorded but left to the deficit path.
+
+    One mis-segmented stride is enough to miss every baseline cluster, and
+    capping on it makes the assistance cut out mid-walk.
+    """
+    config = Config()
+    assert config.assist.required_consecutive_ood_strides > 1
+    policy = _policy(config=config)
+    deficient = _metrics(swing=0.20)
+    for _ in range(config.assist.required_consecutive_deficit_strides):
+        policy.assess(_analysis(manifold_deviation=1.0), deficient)
+    established = policy.gain
+
+    assessment = policy.assess(_analysis(manifold_deviation=1.0, ood=True), deficient)
+    assert assessment.ood and not assessment.ood_engaged
+    assert assessment.state is not DecisionState.OOD
+    assert assessment.limited_assist_gain >= established
+
+    # an in-range stride clears the streak: the count has to be consecutive
+    policy.assess(_analysis(manifold_deviation=1.0), deficient)
+    assert policy.ood_streak == 0
 
 
 def test_an_unmeasured_term_lowers_the_deficit_rather_than_inventing_one() -> None:
@@ -647,3 +692,88 @@ def test_without_a_healthy_reference_the_target_falls_back_to_the_baseline() -> 
     assert model.target_mode is TargetMode.PATIENT_BASELINE
     assert np.allclose(model.z_target, model.z_patient)
     assert np.isnan(model.healthy_region_threshold)
+
+
+# --------------------------------------------------------------------------- #
+# cadence-conditioned reference (one reference per recorded walking speed)
+# --------------------------------------------------------------------------- #
+
+
+def _cadence_reference(stride_time: float, excursion_lower: float) -> HealthyReference:
+    """A reference for one walking speed, with its stride-time interval."""
+    return HealthyReference(
+        log_centroid=np.eye(3) * stride_time,
+        manifold_distance_threshold=1.0,
+        manifold_distance_scale=1.0,
+        metric_ranges={
+            "stride_time": MetricRange(
+                lower=stride_time - 0.05, median=stride_time, upper=stride_time + 0.05
+            ),
+            "belt_excursion": MetricRange(
+                lower=excursion_lower,
+                median=excursion_lower * 1.2,
+                upper=excursion_lower * 1.4,
+            ),
+        },
+    )
+
+
+def _bank() -> ReferenceBank:
+    """A two-speed bank: slow strides travel less than fast ones."""
+    return ReferenceBank(
+        {"slow": _cadence_reference(1.9, 87.0), "fast": _cadence_reference(1.2, 118.0)}
+    )
+
+
+def test_the_bank_selects_the_reference_of_the_measured_cadence() -> None:
+    """The stride's own duration picks the reference, not a fixed recording."""
+    bank = _bank()
+    assert bank.labels == ["fast", "slow"]        # ordered by their interval
+    assert bank.select(1.22) == "fast"            # inside the fast interval
+    assert bank.select(1.88) == "slow"            # inside the slow interval
+    assert bank.select(1.60) == "slow"            # between them: the nearer one
+    # an unknown cadence must not be scored against the fast reference, which
+    # is what invents a deficit out of a slow walk
+    assert bank.select(None) == "slow"
+    assert bank.select(float("nan")) == "slow"
+
+
+def test_a_slow_stride_is_no_deficit_against_its_own_cadence() -> None:
+    """The same stride reads as a deficit only against a faster reference."""
+    bank = _bank()
+    slow_stride = _metrics(excursion=97.0)
+    slow_stride = replace(slow_stride, stride_time=1.9)
+
+    fast_only = BiomechanicalEvaluator(
+        DeviationConfig(biomech_weights={"belt_excursion": 1.0}),
+        bank.references["fast"].metric_ranges,
+        SOURCE_HEALTHY,
+    )
+    conditioned = BiomechanicalEvaluator.from_reference(
+        DeviationConfig(biomech_weights={"belt_excursion": 1.0}), healthy=bank
+    )
+
+    assert fast_only.evaluate(slow_stride).score > 0.1
+    assert conditioned.evaluate(slow_stride).score == 0.0
+    # the log says which cadence scored the stride
+    assert conditioned.evaluate(slow_stride).reference_source.endswith(":slow")
+
+
+def test_the_bank_survives_a_save_and_load(tmp_path: Path) -> None:
+    """A bank reloads as a bank, with every interval intact."""
+    path = tmp_path / "bank.npz"
+    _bank().save(path)
+    loaded = load_reference(path)
+    assert isinstance(loaded, ReferenceBank)
+    assert loaded.labels == ["fast", "slow"]
+    assert loaded.select(1.9) == "slow"
+    assert loaded.references["slow"].metric_ranges["belt_excursion"].lower == 87.0
+
+
+def test_a_single_reference_still_loads_as_one(tmp_path: Path) -> None:
+    """The bank format is additive: one reference keeps loading as before."""
+    path = tmp_path / "one.npz"
+    _cadence_reference(1.2, 118.0).save(path)
+    loaded = load_reference(path)
+    assert isinstance(loaded, HealthyReference)
+    assert loaded.metric_ranges["belt_excursion"].lower == 118.0

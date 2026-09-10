@@ -88,7 +88,14 @@ class MockMotor(MotorInterface):
     Args:
         current_limit_a: saturation limit applied to every command.
         rest_length_mm: belt length the passive spring pulls towards.
-        mm_per_amp: static retraction produced by one ampere.
+        mm_per_amp: static belt displacement produced by one ampere.  Positive,
+            because the device is unidirectional in the other sense: the repo's
+            ``impedance_controller.py`` drives ``belt_length`` towards 0 from a
+            resting value near -130 mm using ``force_to_current_a``, which only
+            emits current for a positive force.  That loop is stable only if a
+            positive current moves the belt towards 0, so the plant sign here
+            has to match.  With the sign inverted the simulated loop runs away,
+            which is a property of the model, not of the device.
         tau_s: time constant of the belt response.
     """
 
@@ -96,7 +103,7 @@ class MockMotor(MotorInterface):
         self,
         current_limit_a: float = 1.0,
         rest_length_mm: float = 0.0,
-        mm_per_amp: float = -40.0,
+        mm_per_amp: float = 40.0,
         tau_s: float = 0.08,
     ) -> None:
         self.current_limit_a = current_limit_a

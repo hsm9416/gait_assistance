@@ -41,7 +41,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -64,7 +64,7 @@ from ..manifold.log_euclidean import (
     matrix_log,
     vectorize_spd,
 )
-from ..manifold.reference import HealthyReference
+from ..manifold.reference import HealthyReference, ReferenceBank
 from .baseline import BaselineResult
 
 
@@ -160,12 +160,25 @@ class PatientModel:
         config: Config,
         baseline: BaselineResult,
         cluster_model: ClusterModel,
-        healthy: Optional[HealthyReference] = None,
+        healthy: Optional[Union[HealthyReference, ReferenceBank]] = None,
         extractor: Optional[FeatureExtractor] = None,
     ) -> None:
         self.config = config
         self.baseline = baseline
         self.clusters = cluster_model
+        # A bank holds one reference per recorded cadence; the stride's own
+        # stride time then picks which one it is measured against.  The model
+        # opens on the reference matching the baseline's cadence, so the
+        # distances it calibrates itself with come from the right one.
+        self.bank: Optional[ReferenceBank] = (
+            healthy if isinstance(healthy, ReferenceBank) else None
+        )
+        self.reference_label: str = ""
+        if self.bank is not None:
+            self.reference_label = self.bank.select(
+                baseline.mean_metrics.get("stride_time")
+            )
+            healthy = self.bank.references[self.reference_label]
         self.healthy = healthy
         self.extractor = extractor or FeatureExtractor(config.feature, config.stride)
         self.normalizer: ZScoreNormalizer = baseline.normalizer
@@ -179,6 +192,39 @@ class PatientModel:
 
         self._previous_state: int = STATE_UNKNOWN
         self.n_analyzed: int = 0
+        #: per-label ``(z_healthy, z_target)``, so switching costs no algebra
+        self._target_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        if self.bank is not None and self.z_healthy is not None:
+            self._target_cache[self.reference_label] = (self.z_healthy, self.z_target)
+
+    def select_reference(self, stride_time: Optional[float]) -> str:
+        """Point the model at the reference matching this stride's cadence.
+
+        Without a bank nothing moves: the single reference stays in place and
+        the returned label is empty.  With one, ``healthy``, ``z_healthy`` and
+        ``z_target`` are swapped for the selected cadence's values, which is
+        what keeps a slow stride from being scored against a fast reference.
+
+        Args:
+            stride_time: the stride's duration (s), or ``None`` when unknown.
+
+        Returns:
+            The label now in use, empty when the model has no bank.
+        """
+        if self.bank is None:
+            return ""
+        label = self.bank.select(stride_time)
+        if label == self.reference_label:
+            return label
+        self.reference_label = label
+        self.healthy = self.bank.references[label]
+        cached = self._target_cache.get(label)
+        if cached is None:
+            self.z_healthy = self.healthy.log_centroid
+            cached = (self.z_healthy, self._resolve_target())
+            self._target_cache[label] = cached
+        self.z_healthy, self.z_target = cached
+        return label
 
     def _resolve_target_mode(self) -> TargetMode:
         """Pick the target mode that the loaded references can support.
@@ -291,7 +337,7 @@ class PatientModel:
         cls,
         config: Config,
         baseline: BaselineResult,
-        healthy: Optional[HealthyReference] = None,
+        healthy: Optional[Union[HealthyReference, ReferenceBank]] = None,
         extractor: Optional[FeatureExtractor] = None,
     ) -> "PatientModel":
         """Cluster the baseline strides and assemble the model (spec 12)."""
@@ -355,6 +401,8 @@ class PatientModel:
             The :class:`StrideAnalysis`.
         """
         epsilon = self.config.manifold.epsilon
+        if metrics is not None:
+            self.select_reference(getattr(metrics, "stride_time", None))
         vector = vectorize_spd(log_current)
         assignment = assign_state(vector, self.clusters.centroid_vectors, epsilon)
 

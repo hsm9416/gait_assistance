@@ -17,6 +17,7 @@ from gait_assistance.config import AssistConfig, Config, PhaseConfig, StrideConf
 from gait_assistance.control.target_generator import BeltTargetGenerator
 from gait_assistance.gait.feature_extractor import compute_stride_metrics
 from gait_assistance.gait.phase_detector import (
+    BeltLengthPhaseDetector,
     PHASE_DETECTORS,
     GaitEvent,
     GaitPhase,
@@ -63,10 +64,17 @@ EVENT_TOL: float = 1.5 * SAMPLE_S
 # --------------------------------------------------------------------------- #
 
 
-def test_scheduled_is_the_default_detector() -> None:
-    """Until the real detector lands, the fixed cadence is what runs."""
-    assert Config().phase.detector == "scheduled"
-    assert isinstance(create_phase_detector(PhaseConfig()), ScheduledPhaseDetector)
+def test_the_default_detector_reads_the_belt_not_a_clock() -> None:
+    """Swing/stance comes from the belt length; the schedule is opt-in."""
+    assert Config().phase.detector == "belt_cycle"
+    assert isinstance(create_phase_detector(PhaseConfig()), BeltLengthPhaseDetector)
+
+
+def test_the_scheduled_placeholder_is_still_selectable() -> None:
+    """The fixed cadence stays available for pipeline runs without a patient."""
+    assert isinstance(
+        create_phase_detector(PhaseConfig(detector="scheduled")), ScheduledPhaseDetector
+    )
 
 
 def test_the_placeholder_declares_that_it_measures_nothing() -> None:
@@ -80,7 +88,7 @@ def test_the_placeholder_declares_that_it_measures_nothing() -> None:
 
 def test_heel_strikes_land_on_the_configured_period() -> None:
     """One stride per ``scheduled_period_s``, on the clock."""
-    config = PhaseConfig(scheduled_period_s=1.0)
+    config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0)
     _, results = _run(config, duration_s=6.0)
     strikes = _event_times(results, GaitEvent.HEEL_STRIKE)
     assert strikes == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], abs=EVENT_TOL)
@@ -88,7 +96,7 @@ def test_heel_strikes_land_on_the_configured_period() -> None:
 
 def test_toe_off_splits_the_cycle_at_the_configured_ratio() -> None:
     """Stance runs first, then swing, in the configured proportion."""
-    config = PhaseConfig(scheduled_period_s=1.0, scheduled_swing_ratio=0.4)
+    config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0, scheduled_swing_ratio=0.4)
     _, results = _run(config, duration_s=3.0)
     toe_offs = _event_times(results, GaitEvent.TOE_OFF)
     # stance = 0.6 s, so swing starts 0.6 s into every cycle
@@ -98,6 +106,7 @@ def test_toe_off_splits_the_cycle_at_the_configured_ratio() -> None:
 def test_an_explicit_swing_duration_overrides_the_ratio() -> None:
     """The timing can be given as a duration instead of a fraction."""
     config = PhaseConfig(
+        detector="scheduled",
         scheduled_period_s=1.0, scheduled_swing_ratio=0.4,
         scheduled_swing_duration_s=0.25,
     )
@@ -111,7 +120,7 @@ def test_an_explicit_swing_duration_overrides_the_ratio() -> None:
 
 def test_the_offset_shifts_the_whole_cycle() -> None:
     """``scheduled_offset_s`` moves the first heel strike."""
-    config = PhaseConfig(scheduled_period_s=1.0, scheduled_offset_s=0.3)
+    config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0, scheduled_offset_s=0.3)
     _, results = _run(config, duration_s=3.0)
     strikes = _event_times(results, GaitEvent.HEEL_STRIKE)
     # The run still opens a cycle on the first sample; the scheduled strikes
@@ -121,7 +130,7 @@ def test_the_offset_shifts_the_whole_cycle() -> None:
 
 def test_the_phase_fractions_match_the_configuration() -> None:
     """The time spent in swing is the configured fraction of the cycle."""
-    config = PhaseConfig(scheduled_period_s=1.0, scheduled_swing_ratio=0.35)
+    config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0, scheduled_swing_ratio=0.35)
     _, results = _run(config, duration_s=10.0)
     phases = [r.phase for _, r in results]
     swing_fraction = sum(p is GaitPhase.SWING for p in phases) / len(phases)
@@ -130,7 +139,7 @@ def test_the_phase_fractions_match_the_configuration() -> None:
 
 def test_progress_sweeps_zero_to_one_within_each_phase() -> None:
     """Every phase reports a monotone progress the belt profile can use."""
-    config = PhaseConfig(scheduled_period_s=1.0, scheduled_swing_ratio=0.4)
+    config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0, scheduled_swing_ratio=0.4)
     _, results = _run(config, duration_s=2.0)
     swing = [r.phase_progress for _, r in results if r.phase is GaitPhase.SWING]
     assert swing and all(p is not None for p in swing)
@@ -142,7 +151,7 @@ def test_progress_sweeps_zero_to_one_within_each_phase() -> None:
 
 def test_swing_never_swallows_the_whole_period() -> None:
     """A misconfigured swing longer than the cycle still leaves a stance."""
-    config = PhaseConfig(scheduled_period_s=1.0, scheduled_swing_duration_s=5.0)
+    config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0, scheduled_swing_duration_s=5.0)
     assert config.swing_duration_s() < 1.0
     assert config.stance_duration_s() > 0.0
     _, results = _run(config, duration_s=3.0)
@@ -152,7 +161,7 @@ def test_swing_never_swallows_the_whole_period() -> None:
 
 def test_the_segmenter_cuts_one_stride_per_scheduled_period() -> None:
     """The scheduled heel strikes drive the stride segmentation."""
-    config = PhaseConfig(scheduled_period_s=1.0)
+    config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0)
     detector = create_phase_detector(config)
     segmenter = StrideSegmenter(StrideConfig())
     strides = []
@@ -290,7 +299,7 @@ def test_assistance_needs_a_known_swing_progress() -> None:
 
 def test_over_a_scheduled_cycle_the_belt_only_moves_in_swing() -> None:
     """End to end: the retraction window lines up with the scheduled swing."""
-    phase_config = PhaseConfig(scheduled_period_s=1.0, scheduled_swing_ratio=0.4)
+    phase_config = PhaseConfig(detector="scheduled", scheduled_period_s=1.0, scheduled_swing_ratio=0.4)
     detector = create_phase_detector(phase_config)
     generator = BeltTargetGenerator(AssistConfig())
 

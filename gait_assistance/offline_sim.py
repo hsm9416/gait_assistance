@@ -29,7 +29,13 @@ from .gait.stride_segmenter import Stride, StrideSegmenter
 from .loops import AssistCommand, HighLevelOutput, LowLevelLoop, TwoLoopRuntime
 from .manifold.covariance import covariance_matrix
 from .manifold.log_euclidean import matrix_log
-from .manifold.reference import HealthyReference, MetricRange, build_healthy_reference
+from .manifold.reference import (
+    HealthyReference,
+    MetricRange,
+    ReferenceBank,
+    build_healthy_reference,
+    load_reference,
+)
 from .patient.baseline import BaselineCollector, build_baseline_from_strides
 from .patient.patient_model import PatientModel
 from .sensors.encoder import MockMotor
@@ -199,14 +205,14 @@ class OfflineSimulator:
         self,
         config: Config,
         csv_path: Union[str, Path],
-        healthy: Optional[HealthyReference] = None,
+        healthy: Optional[Union[HealthyReference, ReferenceBank]] = None,
         *,
         stride_csv: Optional[Union[str, Path]] = None,
     ) -> None:
         self.config = config
         self.csv_path = Path(csv_path)
         if healthy is None and config.reference.path:
-            healthy = HealthyReference.load(config.reference.path)
+            healthy = load_reference(config.reference.path)
         self.healthy = healthy
         self.stride_csv = stride_csv if stride_csv is not None else config.logging.stride_csv
 
@@ -366,6 +372,9 @@ def build_table(
                 "target_belt_length": output.baseline_belt_length
                 - output.assist_gain * max_retraction_mm,
                 "ood_flag": int(analysis.is_ood),
+                "ood_engaged": (
+                    0 if assessment is None else int(assessment.ood_engaged)
+                ),
                 "valid": int(analysis.valid),
             }
         )

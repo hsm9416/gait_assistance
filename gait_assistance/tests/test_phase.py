@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
+
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pytest
@@ -22,6 +24,7 @@ from gait_assistance.gait.feature_extractor import (
 )
 from gait_assistance.gait.normalization import ZScoreNormalizer
 from gait_assistance.gait.phase_detector import (
+    BeltLengthPhaseDetector,
     BeltVelocityPhaseDetector,
     GaitEvent,
     GaitPhase,
@@ -110,8 +113,13 @@ def test_detector_reset_clears_the_state() -> None:
 
 
 def test_segmenter_cuts_at_heel_strikes(config: Config) -> None:
-    """Strides run from one heel strike to the next."""
-    detector = create_phase_detector(config.phase)
+    """Strides run from one heel strike to the next.
+
+    Driven through the belt-velocity detector: the waveform below holds the
+    belt length constant, which is exactly the case the default belt-length
+    detector refuses to call walking.
+    """
+    detector = create_phase_detector(PhaseConfig(detector="belt_velocity"))
     segmenter = StrideSegmenter(config.stride)
     strides = []
     for i in range(600):
@@ -268,3 +276,199 @@ def test_normalizer_roundtrip_and_errors(strides: List[Stride]) -> None:
         normalizer.transform(np.zeros((100, 2)))
     with pytest.raises(ValueError):
         ZScoreNormalizer().fit([])
+
+
+# --------------------------------------------------------------------------- #
+# The belt-length detector (default): belt_length is the only channel it reads
+# --------------------------------------------------------------------------- #
+
+
+def _belt_walk(
+    n: int = 900,
+    rate_hz: float = 100.0,
+    period_s: float = 1.2,
+    amplitude_mm: float = 60.0,
+    offset_mm: float = -130.0,
+) -> List[Tuple[float, float]]:
+    """Synthesise ``(timestamp, belt_length)`` for a steady belt cycle.
+
+    The shape mirrors the recordings in ``csv/``: the belt extends through the
+    swing and retracts around heel strike.
+    """
+    return [
+        (
+            i / rate_hz,
+            offset_mm - amplitude_mm * math.cos(2.0 * math.pi * (i / rate_hz) / period_s),
+        )
+        for i in range(n)
+    ]
+
+
+def _run_belt_length(
+    walk: List[Tuple[float, float]], config: Optional[PhaseConfig] = None, **channels: float
+) -> Tuple[BeltLengthPhaseDetector, List[float], List[float]]:
+    """Drive the belt-length detector and collect its event times."""
+    detector = BeltLengthPhaseDetector(config or PhaseConfig())
+    strikes: List[float] = []
+    toe_offs: List[float] = []
+    for t, belt in walk:
+        result = detector.update(_sample(t, belt_length=belt, **channels))
+        if result.heel_strike:
+            strikes.append(t)
+        elif result.toe_off:
+            toe_offs.append(t)
+    return detector, strikes, toe_offs
+
+
+def test_the_belt_is_the_only_signal_the_default_detector_reads() -> None:
+    """The default takes the stride boundary from the belt and nothing else."""
+    assert Config().phase.detector == "belt_cycle"
+    detector = create_phase_detector()
+    assert isinstance(detector, BeltLengthPhaseDetector)   # belt_cycle subclasses it
+    assert detector.phase_source == "belt_cycle"
+    assert BeltLengthPhaseDetector.phase_source == "belt_length_derived"
+    assert not BeltLengthPhaseDetector.is_placeholder
+    assert not BeltLengthPhaseDetector.ground_truth_validated
+
+
+def test_belt_length_detector_finds_one_stride_per_cycle() -> None:
+    """A 1.2 s belt cycle yields heel strikes 1.2 s apart."""
+    _detector, strikes, toe_offs = _run_belt_length(_belt_walk(period_s=1.2))
+    assert len(strikes) >= 5
+    intervals = np.diff(strikes)
+    # The amplitude envelope needs about one time constant to settle, so the
+    # first strides trip the falling threshold slightly early; the cadence is
+    # exact once it has.
+    assert np.allclose(intervals, 1.2, atol=0.05)
+    assert np.allclose(intervals[2:], 1.2, atol=0.02)
+    # exactly one toe-off between consecutive heel strikes
+    for start, end in zip(strikes, strikes[1:]):
+        assert sum(1 for x in toe_offs if start < x < end) == 1
+
+
+def test_belt_length_detector_reads_nothing_but_the_belt() -> None:
+    """Velocity, IMU and motor channels cannot change a single event."""
+    walk = _belt_walk()
+    _d1, strikes_a, toe_a = _run_belt_length(walk)
+    _d2, strikes_b, toe_b = _run_belt_length(
+        walk,
+        belt_velocity=-9999.0, gyro_z=5000.0, gyro_x=-5000.0,
+        accel_x=9.0, accel_y=-9.0, motor_current=7.0, motor_position=1234.0,
+    )
+    assert strikes_a == strikes_b
+    assert toe_a == toe_b
+    assert strikes_a  # and it did detect something
+
+
+def test_belt_length_detector_is_immune_to_a_resting_length_offset() -> None:
+    """The same gait at a different harness setting gives the same events."""
+    base = _belt_walk(offset_mm=-130.0)
+    shifted = [(t, b + 500.0) for t, b in base]
+    _d1, strikes_a, _ = _run_belt_length(base)
+    _d2, strikes_b, _ = _run_belt_length(shifted)
+    assert strikes_a == strikes_b
+
+
+def test_belt_length_detector_is_immune_to_amplitude_scaling() -> None:
+    """A larger stride triggers at the same instants, not more often."""
+    _d1, strikes_a, _ = _run_belt_length(_belt_walk(amplitude_mm=40.0))
+    _d2, strikes_b, _ = _run_belt_length(_belt_walk(amplitude_mm=160.0))
+    assert strikes_a == strikes_b
+
+
+def test_belt_length_detector_tracks_a_drifting_baseline() -> None:
+    """A slowly settling harness does not add or drop a stride."""
+    walk = [(t, b + 30.0 * t / 9.0) for t, b in _belt_walk()]  # +30 mm over the run
+    _detector, strikes, _ = _run_belt_length(walk)
+    assert len(strikes) >= 5
+    assert np.allclose(np.diff(strikes), 1.2, atol=0.05)
+
+
+def test_standing_still_produces_no_strides() -> None:
+    """Below the amplitude floor there is no gait, so no events at all."""
+    rng = np.random.default_rng(0)
+    still = [(i / 100.0, -130.0 + float(rng.normal(0.0, 0.3))) for i in range(900)]
+    detector, strikes, toe_offs = _run_belt_length(still)
+    assert strikes == [] and toe_offs == []
+    assert not detector.is_walking
+    assert detector.amplitude_mm < PhaseConfig().belt_min_amplitude_mm
+
+
+def test_the_amplitude_floor_is_what_gates_the_events() -> None:
+    """A belt swing just under and just over the floor separates the two cases."""
+    config = PhaseConfig(belt_min_amplitude_mm=20.0)
+    _d1, quiet, _ = _run_belt_length(_belt_walk(amplitude_mm=10.0), config)
+    _d2, walking, _ = _run_belt_length(_belt_walk(amplitude_mm=120.0), config)
+    assert quiet == []
+    assert len(walking) >= 5
+
+
+def test_belt_length_refractory_suppresses_a_double_strike() -> None:
+    """A cycle shorter than the refractory period cannot produce two strikes."""
+    walk = _belt_walk(n=600, period_s=0.4)
+    _detector, strikes, _ = _run_belt_length(walk, PhaseConfig(refractory_s=1.0))
+    assert all(b - a >= 1.0 for a, b in zip(strikes, strikes[1:]))
+
+
+def test_belt_length_detector_survives_a_non_finite_reading() -> None:
+    """A NaN frame is skipped; the envelope and the phase stay usable."""
+    detector = BeltLengthPhaseDetector(PhaseConfig())
+    for t, belt in _belt_walk(n=300):
+        detector.update(_sample(t, belt_length=belt))
+    baseline, amplitude, phase = detector.baseline_mm, detector.amplitude_mm, detector.phase
+    result = detector.update(_sample(3.0, belt_length=float("nan")))
+    assert result.event is None
+    assert result.phase is phase
+    assert detector.baseline_mm == baseline
+    assert detector.amplitude_mm == amplitude
+
+
+def test_belt_length_detector_reset_clears_the_envelope() -> None:
+    """After a reset the detector is indistinguishable from a fresh one."""
+    detector = BeltLengthPhaseDetector(PhaseConfig())
+    for t, belt in _belt_walk(n=300):
+        detector.update(_sample(t, belt_length=belt))
+    assert detector.baseline_mm is not None
+    detector.reset()
+    assert detector.baseline_mm is None
+    assert detector.amplitude_mm == 0.0
+    assert detector.phase is GaitPhase.STANCE
+    assert detector.stride_period_s is None
+
+
+def test_belt_length_detector_reports_phase_progress() -> None:
+    """The belt target needs progress inside the swing, so it must be filled."""
+    detector = BeltLengthPhaseDetector(PhaseConfig())
+    progress: List[float] = []
+    for t, belt in _belt_walk():
+        result = detector.update(_sample(t, belt_length=belt))
+        if result.phase is GaitPhase.SWING and result.phase_progress is not None:
+            progress.append(result.phase_progress)
+    assert progress
+    assert min(progress) >= 0.0 and max(progress) <= 1.0
+    assert max(progress) > 0.8  # the profile really does sweep the swing
+
+
+def test_belt_length_detector_populates_the_stride_statistics() -> None:
+    """Stride period and swing duration come out of the inherited helpers."""
+    detector, strikes, _ = _run_belt_length(_belt_walk(period_s=1.2))
+    assert detector.stride_period_s == pytest.approx(1.2, abs=0.05)
+    assert detector.swing_duration_s is not None
+    assert 0.0 < detector.swing_duration_s < 1.2
+
+
+def test_segmenter_cuts_strides_from_the_belt_length_alone() -> None:
+    """End to end: the default detector drives the stride segmentation."""
+    config = Config()
+    detector = create_phase_detector(config.phase)
+    segmenter = StrideSegmenter(config.stride)
+    strides = []
+    for t, belt in _belt_walk(n=1200):
+        sample = _sample(t, belt_length=belt)
+        completed = segmenter.update(sample, detector.update(sample))
+        if completed is not None:
+            strides.append(completed)
+    assert len(strides) >= 5
+    for stride in strides:
+        assert stride.duration_s == pytest.approx(1.2, abs=0.05)
+        assert stride.phase_source == "belt_cycle"

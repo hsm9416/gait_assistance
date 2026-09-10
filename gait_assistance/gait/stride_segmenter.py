@@ -73,6 +73,15 @@ class Stride:
             return False, f"too long ({self.duration_s:.3f}s)"
         if not np.all(np.isfinite(self.to_array(("belt_length", "belt_velocity")))):
             return False, "non-finite samples"
+        # A stride the detector could not split carries no swing/stance
+        # information: its swing_time would read 0 s rather than "unknown" and
+        # would enter the baseline as a large false deficit.  The first stride
+        # of a session is the usual case - a detector that places the phases by
+        # cycle fraction has no period yet.
+        if not self.phase_mask(GaitPhase.SWING).any():
+            return False, "no swing samples (phase not established yet)"
+        if not self.phase_mask(GaitPhase.STANCE).any():
+            return False, "no stance samples (phase not established yet)"
         return True, ""
 
 

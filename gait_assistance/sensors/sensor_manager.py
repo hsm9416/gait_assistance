@@ -370,6 +370,8 @@ class PadSensorSource(SensorSource):
         self.config = config
         self._controller = controller
         self._seq = 0
+        #: problems met while shutting down; see :meth:`close`
+        self.close_errors: List[str] = []
 
     @property
     def controller(self) -> object:
@@ -396,13 +398,25 @@ class PadSensorSource(SensorSource):
         self._controller.start_session()  # type: ignore[attr-defined]
 
     def close(self) -> None:
-        """Stop the session and close the serial link."""
+        """Stop the session and release the serial port.
+
+        A USB device unplugged or reset mid-run fails every later write with
+        ``OSError``, so it cannot be told to stop streaming.  Shutting down has
+        to release the port anyway, and a traceback from here would bury the
+        operator's actual problem, so both steps are attempted and whatever
+        failed is recorded in :attr:`close_errors`.
+        """
         if self._controller is None:
             return
-        try:
-            self._controller.stop_session()  # type: ignore[attr-defined]
-        finally:
-            self._controller.close()  # type: ignore[attr-defined]
+        self.close_errors = []
+        for what, call in (
+            ("stop_session", self._controller.stop_session),  # type: ignore[attr-defined]
+            ("close", self._controller.close),  # type: ignore[attr-defined]
+        ):
+            try:
+                call()
+            except Exception as exc:
+                self.close_errors.append(f"{what} failed: {exc}")
 
     def read(self) -> Optional[SensorSample]:
         """Poll the link and convert a telemetry frame, if one arrived."""
@@ -460,6 +474,11 @@ class SensorManager:
     def close(self) -> None:
         """Close the underlying source."""
         self.source.close()
+
+    @property
+    def close_errors(self) -> List[str]:
+        """Problems the source met while shutting down; empty when clean."""
+        return list(getattr(self.source, "close_errors", ()))
 
     def poll(self) -> Optional[Tuple[SensorSample, SensorHealth]]:
         """Read one frame.

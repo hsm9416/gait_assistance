@@ -17,13 +17,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 from .config import AssistMode, Config, RunMode, TargetMode
 from .control.assistance_policy import PHASE_DERIVED_METRICS, TERM_METRICS
 from .gait.phase_detector import create_phase_detector
 from .loops import AssistCommand, LowLevelLoop, TwoLoopRuntime
-from .manifold.reference import HealthyReference
+from .manifold.reference import HealthyReference, ReferenceBank, load_reference
 from .offline_sim import (
     OfflineSimulator,
     build_healthy_reference_from_csv,
@@ -80,7 +80,7 @@ def cmd_offline(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    healthy: Optional[HealthyReference] = None
+    healthy: Optional[Union[HealthyReference, ReferenceBank]] = None
     if args.healthy_csv:
         healthy = build_healthy_reference_from_csv(args.healthy_csv, config)
         healthy.save(out_dir / "healthy_reference.npz")
@@ -90,7 +90,7 @@ def cmd_offline(args: argparse.Namespace) -> int:
             f"threshold={healthy.distance_threshold:.3f}"
         )
     elif args.healthy_ref:
-        healthy = HealthyReference.load(args.healthy_ref)
+        healthy = load_reference(args.healthy_ref)
 
     stride_csv = out_dir / "stride_log.csv"
     simulator = OfflineSimulator(config, args.csv, healthy, stride_csv=stride_csv)
@@ -214,7 +214,7 @@ def _build_runtime(
 ) -> TwoLoopRuntime:
     """Assemble the two-loop runtime shared by the live and simulated modes."""
     healthy = (
-        HealthyReference.load(config.reference.path) if config.reference.path else None
+        load_reference(config.reference.path) if config.reference.path else None
     )
     low = LowLevelLoop(config, sensors, motor, AssistCommand())
     return TwoLoopRuntime(
@@ -307,6 +307,8 @@ def _report(runtime: TwoLoopRuntime, cycles: int) -> None:
             print(
                 f"[run] gain mean={sum(gains) / len(gains):.3f}  max={max(gains):.3f}  "
                 f"ood={sum(o.analysis.is_ood for o in outputs)}"
+                # only a streak of flagged strides actually caps the gain
+                f" (capping={sum(1 for o in outputs if o.assessment is not None and o.assessment.ood_engaged)})"
             )
             counts: Dict[str, int] = {}
             for output in outputs:

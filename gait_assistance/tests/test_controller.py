@@ -20,6 +20,7 @@ from gait_assistance.control.assistance_policy import (
     DeviationScorer,
 )
 from gait_assistance.control.impedance_controller import (
+    IMPEDANCE_HEADROOM_N,
     ImpedanceController,
     default_force_to_current,
 )
@@ -34,9 +35,10 @@ from gait_assistance.gait.phase_detector import GaitPhase
 from gait_assistance.loops import AssistCommand, HighLevelLoop, LowLevelLoop, TwoLoopRuntime
 from gait_assistance.patient.baseline import BaselineCollector, build_baseline_from_strides
 from gait_assistance.patient.patient_model import PatientModel, StrideAnalysis
-from gait_assistance.sensors.encoder import MockMotor
+from gait_assistance.sensors.encoder import MockMotor, PadMotor
 from gait_assistance.sensors.sensor_manager import (
     MockSensorSource,
+    PadSensorSource,
     SensorManager,
     SensorSample,
 )
@@ -662,3 +664,230 @@ def test_low_level_loop_holds_position_until_the_model_exists() -> None:
         assert output is not None
         assert output.target.target_belt_length == pytest.approx(output.sample.belt_length)
         assert output.command.position_error_mm == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Feed-forward assist force
+# --------------------------------------------------------------------------- #
+
+
+def test_assist_force_is_off_by_default() -> None:
+    """The default configuration reproduces the pure position/velocity law."""
+    controller = ImpedanceController(ImpedanceConfig())
+    assert controller.config.assist_force_n == 0.0
+    command = controller.compute(-130.0, -130.0, assist_fraction=1.0)
+    assert command.force_n == 0.0
+    assert command.assist_force_n == 0.0
+    assert command.current_a == 0.0
+
+
+def test_assist_force_scales_with_the_fraction() -> None:
+    """``assist_force_n * assist_fraction`` is added to the impedance force."""
+    controller = ImpedanceController(
+        ImpedanceConfig(assist_force_n=5.0, current_limit_a=100.0)
+    )
+    for fraction in (0.0, 0.25, 0.5, 1.0):
+        command = controller.compute(-130.0, -130.0, assist_fraction=fraction)
+        assert command.assist_force_n == pytest.approx(5.0 * fraction)
+        assert command.impedance_force_n == pytest.approx(0.0)
+        assert command.force_n == pytest.approx(5.0 * fraction)
+
+
+def test_assist_force_adds_to_the_impedance_term() -> None:
+    """The two contributions sum, and the command reports them separately."""
+    config = ImpedanceConfig(
+        stiffness_n_per_mm=0.01, damping_n_per_mms=0.002,
+        assist_force_n=4.0, use_pad_force_map=False,
+        current_per_newton=1.0, current_limit_a=100.0,
+    )
+    command = ImpedanceController(config).compute(
+        -100.0, -150.0, measured_velocity=-10.0, assist_fraction=0.5
+    )
+    expected_impedance = 0.01 * 50.0 + 0.002 * 10.0
+    assert command.impedance_force_n == pytest.approx(expected_impedance)
+    assert command.assist_force_n == pytest.approx(2.0)
+    assert command.force_n == pytest.approx(expected_impedance + 2.0)
+    assert command.current_a == pytest.approx(command.force_n)
+
+
+def test_assist_fraction_is_clipped_to_the_unit_interval() -> None:
+    """A caller cannot ask for more than the configured peak force."""
+    controller = ImpedanceController(
+        ImpedanceConfig(assist_force_n=5.0, current_limit_a=100.0)
+    )
+    assert controller.compute(-130.0, -130.0, assist_fraction=3.0).assist_force_n == 5.0
+    assert controller.compute(-130.0, -130.0, assist_fraction=-2.0).assist_force_n == 0.0
+
+
+def test_assist_force_still_respects_the_current_limit() -> None:
+    """The ceiling applies to the sum, so the safety limit is not bypassed."""
+    controller = ImpedanceController(
+        ImpedanceConfig(assist_force_n=50.0, current_limit_a=1.0)
+    )
+    command = controller.compute(-130.0, -130.0, assist_fraction=1.0)
+    assert command.current_a == pytest.approx(1.0)
+    assert command.saturated
+
+
+def test_non_finite_assist_fraction_is_safe() -> None:
+    """A NaN fraction produces a zero command like any other bad input."""
+    controller = ImpedanceController(ImpedanceConfig(assist_force_n=5.0))
+    command = controller.compute(-130.0, -130.0, assist_fraction=float("nan"))
+    assert command.current_a == 0.0
+    assert command.is_finite()
+
+
+def test_low_level_loop_feeds_gain_times_profile_to_the_controller() -> None:
+    """The assistance the high level decided is what reaches the force term.
+
+    The force is kept small on purpose: ``MockMotor`` moves the belt 40 mm per
+    ampere, which is a stand-in number, not a calibration of the device, so a
+    realistic assist force would drive the simulated belt clean out of its
+    range.  What is under test here is the relationship, not the magnitude.
+    """
+    config = Config()
+    config.impedance.assist_force_n = 0.3
+    config.impedance.current_limit_a = 1.0
+    motor = MockMotor(current_limit_a=config.impedance.current_limit_a)
+    sensors = SensorManager(MockSensorSource(config.sensor, motor=motor), config.sensor)
+    sensors.open()
+    assist = AssistCommand(baseline_belt_length=-130.0)
+    assist.publish(config.assist.max_gain, -130.0, 0)
+    loop = LowLevelLoop(config, sensors, motor, assist)
+
+    seen = []
+    for _ in range(2000):
+        output = loop.step()
+        assert output is not None
+        expected = (
+            config.impedance.assist_force_n
+            * output.target.assist_gain
+            * output.target.profile_value
+        )
+        assert output.command.assist_force_n == pytest.approx(expected)
+        seen.append(output.command.assist_force_n)
+    # the profile really does sweep, so the force is not a constant
+    peak = config.impedance.assist_force_n * config.assist.max_gain
+    assert max(seen) > 0.5 * peak
+    assert max(seen) <= peak + 1e-12
+    assert min(seen) == pytest.approx(0.0)
+
+
+def test_assist_force_only_acts_in_swing() -> None:
+    """Stance has no swing profile, so the feed-forward term stays at zero."""
+    config = Config()
+    config.impedance.assist_force_n = 0.3
+    config.impedance.current_limit_a = 1.0
+    motor = MockMotor(current_limit_a=config.impedance.current_limit_a)
+    sensors = SensorManager(MockSensorSource(config.sensor, motor=motor), config.sensor)
+    sensors.open()
+    assist = AssistCommand(baseline_belt_length=-130.0)
+    assist.publish(config.assist.max_gain, -130.0, 0)
+    loop = LowLevelLoop(config, sensors, motor, assist)
+    for _ in range(2000):
+        output = loop.step()
+        assert output is not None
+        if output.phase.phase is GaitPhase.STANCE:
+            assert output.command.assist_force_n == pytest.approx(0.0)
+
+
+def test_a_dead_link_does_not_stop_the_shutdown() -> None:
+    """A vanished device must not turn shutdown into a traceback.
+
+    A USB disconnect mid-run fails every later write with ``OSError``.  Raising
+    from the shutdown path would abandon whatever comes after it - the open log
+    files - and lose the tail of the run that has to be examined, so both the
+    motor de-energise and the link close report instead of raising.
+    """
+
+    class DeadController:
+        """Every write fails, as pyserial does after the device goes away."""
+
+        def stop_session(self, timeout_s: float = 2.0) -> bool:
+            raise OSError(5, "Input/output error")
+
+        def close(self) -> None:
+            raise OSError(5, "Input/output error")
+
+        def set_current(self, current_a: float) -> None:
+            raise OSError(5, "Input/output error")
+
+    config = Config()
+    source = PadSensorSource(config.sensor, controller=DeadController())
+    sensors = SensorManager(source, config.sensor)
+    sensors.close()
+    assert len(sensors.close_errors) == 2        # stop_session and close
+
+    loop = LowLevelLoop(config, sensors, PadMotor(DeadController()), AssistCommand())
+    loop.stop()
+    assert loop.stop_errors and "0 A" in loop.stop_errors[0]
+
+
+def test_a_clean_shutdown_reports_no_problems() -> None:
+    """The tolerant shutdown path stays silent when nothing went wrong."""
+    config = Config()
+    motor = MockMotor(current_limit_a=config.impedance.current_limit_a)
+    sensors = SensorManager(MockSensorSource(config.sensor, motor=motor), config.sensor)
+    sensors.open()
+    loop = LowLevelLoop(config, sensors, motor, AssistCommand())
+    loop.stop()
+    sensors.close()
+    assert loop.stop_errors == []
+    assert sensors.close_errors == []
+    assert motor.last_command_a == 0.0
+
+
+def test_the_force_ceiling_follows_the_current_limit() -> None:
+    """``max_force_n`` inverts the force map at the configured limit."""
+    for limit in (2.5, 4.0, 5.5):
+        config = ImpedanceConfig(current_limit_a=limit)
+        controller = ImpedanceController(config)
+        ceiling = controller.max_force_n()
+        assert controller.force_to_current(ceiling) == pytest.approx(limit, abs=1e-6)
+        # one newton more cannot get through
+        assert controller.force_to_current(ceiling + 1.0) > limit - 1e-9
+    assert ImpedanceController(ImpedanceConfig(current_limit_a=0.0)).max_force_n() == 0.0
+
+
+def test_a_sized_assist_force_never_saturates() -> None:
+    """A force sized by ``assist_force_limit_n`` survives the whole profile.
+
+    The point of sizing is shape: a command above what the limit passes is
+    delivered as a plateau at the limit, so the wearer feels a square pulse
+    instead of the commanded sine.
+    """
+    config = ImpedanceConfig(current_limit_a=4.0)
+    controller = ImpedanceController(config)
+    max_gain = AssistConfig().max_gain
+    config.assist_force_n = controller.assist_force_limit_n(max_gain)
+    assert config.assist_force_n > 0.0
+
+    for step in range(101):                     # one full sine swing profile
+        profile = float(np.sin(np.pi * step / 100))
+        command = controller.compute(
+            target_position=-130.0,
+            measured_position=-130.0,
+            target_velocity=0.0,
+            # the worst positive impedance contribution the reserve covers
+            measured_velocity=-IMPEDANCE_HEADROOM_N / config.damping_n_per_mms,
+            assist_fraction=max_gain * profile,
+        )
+        assert not command.saturated
+        assert command.current_a <= config.current_limit_a + 1e-12
+
+
+def test_an_oversized_assist_force_is_reported_as_clipping() -> None:
+    """The sizing helper is the boundary: just above it the command clips."""
+    config = ImpedanceConfig(current_limit_a=4.0)
+    controller = ImpedanceController(config)
+    max_gain = AssistConfig().max_gain
+    config.assist_force_n = controller.assist_force_limit_n(max_gain) * 4.0
+    command = controller.compute(
+        target_position=-130.0,
+        measured_position=-130.0,
+        target_velocity=0.0,
+        measured_velocity=0.0,
+        assist_fraction=max_gain,
+    )
+    assert command.saturated
+    assert command.current_a == pytest.approx(config.current_limit_a)

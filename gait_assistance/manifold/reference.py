@@ -233,6 +233,60 @@ class HealthyReference:
             "metrics": {k: float(v) for k, v in self.metrics.items()},
         }
 
+    @classmethod
+    def from_metadata(
+        cls,
+        log_centroid: np.ndarray,
+        metadata: Mapping[str, object],
+        *,
+        fallback_threshold: float = 0.0,
+        fallback_mean: float = 0.0,
+        fallback_std: float = 0.0,
+        fallback_strides: int = 0,
+        fallback_feature_names: Sequence[str] = (),
+        fallback_metrics: Optional[Mapping[str, float]] = None,
+    ) -> "HealthyReference":
+        """Rebuild a reference from its centroid and :meth:`to_metadata` dict.
+
+        Args:
+            log_centroid: ``Z_H``.
+            metadata: what :meth:`to_metadata` produced.
+            fallback_threshold: threshold to use when the metadata omits it.
+            fallback_mean: distance mean to use when the metadata omits it.
+            fallback_std: distance spread to use when the metadata omits it.
+            fallback_strides: stride count to use when the metadata omits it.
+            fallback_feature_names: feature names to use when omitted.
+            fallback_metrics: healthy metric means to use when omitted.
+
+        Returns:
+            The reference.  Shared by :meth:`load` and by
+            :class:`ReferenceBank`, so both formats interpret the metadata the
+            same way.
+        """
+        meta = dict(metadata)
+        return cls(
+            log_centroid=np.asarray(log_centroid, dtype=float),
+            manifold_distance_threshold=float(
+                meta.get("manifold_distance_threshold", fallback_threshold)
+            ),
+            manifold_distance_median=float(
+                meta.get("manifold_distance_median", fallback_mean)
+            ),
+            manifold_distance_scale=float(
+                meta.get("manifold_distance_scale", max(fallback_std, 1e-9))
+            ),
+            metric_ranges={
+                k: MetricRange.from_dict(v)
+                for k, v in meta.get("metric_ranges", {}).items()
+            },
+            num_strides=int(meta.get("num_strides", fallback_strides)),
+            speed_conditioned=bool(meta.get("speed_conditioned", False)),
+            distance_mean=float(meta.get("distance_mean", fallback_mean)),
+            distance_std=float(meta.get("distance_std", fallback_std)),
+            feature_names=tuple(meta.get("feature_names", fallback_feature_names)),
+            metrics=dict(meta.get("metrics", fallback_metrics or {})),
+        )
+
     def save(self, path: Union[str, Path]) -> None:
         """Store the reference as a compressed ``.npz`` archive.
 
@@ -275,28 +329,15 @@ class HealthyReference:
                 else ()
             )
             if "metadata" in data:
-                meta = json.loads(str(data["metadata"]))
-                return cls(
-                    log_centroid=centroid,
-                    manifold_distance_threshold=float(
-                        meta.get("manifold_distance_threshold", threshold)
-                    ),
-                    manifold_distance_median=float(
-                        meta.get("manifold_distance_median", mean)
-                    ),
-                    manifold_distance_scale=float(
-                        meta.get("manifold_distance_scale", max(std, 1e-9))
-                    ),
-                    metric_ranges={
-                        k: MetricRange.from_dict(v)
-                        for k, v in meta.get("metric_ranges", {}).items()
-                    },
-                    num_strides=int(meta.get("num_strides", int(data["n_strides"]))),
-                    speed_conditioned=bool(meta.get("speed_conditioned", False)),
-                    distance_mean=float(meta.get("distance_mean", mean)),
-                    distance_std=float(meta.get("distance_std", std)),
-                    feature_names=tuple(meta.get("feature_names", feature_names)),
-                    metrics=dict(meta.get("metrics", legacy_metrics)),
+                return cls.from_metadata(
+                    centroid,
+                    json.loads(str(data["metadata"])),
+                    fallback_threshold=threshold,
+                    fallback_mean=mean,
+                    fallback_std=std,
+                    fallback_strides=int(data["n_strides"]),
+                    fallback_feature_names=feature_names,
+                    fallback_metrics=legacy_metrics,
                 )
             return cls(
                 log_centroid=centroid,
@@ -310,6 +351,179 @@ class HealthyReference:
                 feature_names=feature_names,
                 metrics=legacy_metrics,
             )
+
+
+@dataclass
+class ReferenceBank:
+    """Several healthy references, one per cadence, chosen per stride.
+
+    One healthy reference is only comparable to gait at the speed it was
+    recorded at.  The same person walking more slowly takes longer strides in
+    time and moves the belt less, so measured against a faster reference that
+    reads as a deficit that is not there: the 14:42 run (stride 1.76 s) scored
+    ``E_B = 0.105`` against the 1.0 m/s reference and ``0.004`` against the
+    0.4 m/s one, from the same recordings of the same person.
+
+    The bank holds one reference per recorded cadence and selects the one whose
+    ``stride_time`` interval the stride actually falls in.  Stride time is used
+    rather than walking speed because the device measures it; a belt-mounted
+    sensor has no ground speed.
+
+    Args:
+        references: label -> reference, one per recorded cadence.
+        select_metric: metric whose interval decides the selection.
+    """
+
+    references: Dict[str, HealthyReference]
+    select_metric: str = "stride_time"
+
+    def __post_init__(self) -> None:
+        if not self.references:
+            raise ValueError("a reference bank needs at least one reference")
+
+    @property
+    def labels(self) -> Sequence[str]:
+        """Labels ordered by their selection interval, slowest cadence last."""
+        def key(label: str) -> float:
+            interval = self.interval(label)
+            return interval.lower if interval is not None else float("inf")
+        return sorted(self.references, key=key)
+
+    def interval(self, label: str) -> Optional[MetricRange]:
+        """Selection interval of one reference, or ``None`` when it has none."""
+        return self.references[label].metric_ranges.get(self.select_metric)
+
+    def gap(self, label: str, value: float) -> float:
+        """Distance from ``value`` to a reference's selection interval.
+
+        Returns:
+            ``0`` when the value lies inside the interval, otherwise how far
+            outside it is.  A reference without the selection metric is
+            infinitely far away, so it is only ever chosen as a last resort.
+        """
+        interval = self.interval(label)
+        if interval is None:
+            return float("inf")
+        if value < interval.lower:
+            return float(interval.lower - value)
+        if value > interval.upper:
+            return float(value - interval.upper)
+        return 0.0
+
+    def select(self, value: Optional[float]) -> str:
+        """Label of the reference to measure a stride of this cadence against.
+
+        Args:
+            value: the stride's ``select_metric`` value, e.g. its stride time.
+
+        Returns:
+            The label whose interval contains the value, or failing that the
+            nearest one.  A missing or non-finite value selects the slowest
+            reference rather than guessing: over-estimating the cadence is what
+            invents a deficit.
+        """
+        labels = list(self.labels)
+        if value is None or not np.isfinite(value):
+            return labels[-1]
+        return min(labels, key=lambda label: (self.gap(label, float(value)), label))
+
+    def reference(self, value: Optional[float]) -> HealthyReference:
+        """The reference :meth:`select` picks for this cadence."""
+        return self.references[self.select(value)]
+
+    def describe(self) -> str:
+        """One line per reference: its label, interval and stride count."""
+        rows = []
+        for label in self.labels:
+            interval = self.interval(label)
+            span = (
+                f"{interval.lower:.2f}..{interval.upper:.2f}"
+                if interval is not None
+                else "no interval"
+            )
+            rows.append(f"{label}: {self.select_metric} {span} "
+                        f"({self.references[label].num_strides} strides)")
+        return "\n".join(rows)
+
+    # -- persistence -------------------------------------------------------- #
+
+    def save(self, path: Union[str, Path]) -> None:
+        """Store the whole bank as one ``.npz`` archive.
+
+        The archive carries a ``bank`` entry, which is what
+        :func:`load_reference` sniffs for to tell a bank from a single
+        reference.
+        """
+        arrays: Dict[str, object] = {
+            "bank": json.dumps(
+                {"labels": list(self.labels), "select_metric": self.select_metric}
+            )
+        }
+        for label, ref in self.references.items():
+            arrays[f"{label}__log_centroid"] = ref.log_centroid
+            arrays[f"{label}__metadata"] = json.dumps(ref.to_metadata())
+        np.savez(Path(path), **arrays)
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "ReferenceBank":
+        """Load a bank written by :meth:`save`.
+
+        Raises:
+            ValueError: if the archive is not a bank.
+        """
+        with np.load(Path(path), allow_pickle=True) as data:
+            if "bank" not in data:
+                raise ValueError(f"{path} is a single reference, not a bank")
+            header = json.loads(str(data["bank"]))
+            references = {
+                label: HealthyReference.from_metadata(
+                    np.asarray(data[f"{label}__log_centroid"], dtype=float),
+                    json.loads(str(data[f"{label}__metadata"])),
+                )
+                for label in header["labels"]
+            }
+        return cls(references, str(header.get("select_metric", "stride_time")))
+
+    @classmethod
+    def from_files(
+        cls, paths: Mapping[str, Union[str, Path]], select_metric: str = "stride_time"
+    ) -> "ReferenceBank":
+        """Build a bank from single-reference archives.
+
+        Args:
+            paths: label -> path of a reference written by
+                :meth:`HealthyReference.save`.
+            select_metric: metric whose interval decides the selection.
+
+        Returns:
+            The bank.  Every reference is marked ``speed_conditioned`` so a
+            reader of one member knows it is not a pooled population interval.
+        """
+        references = {}
+        for label, path in paths.items():
+            ref = HealthyReference.load(path)
+            ref.speed_conditioned = True
+            references[label] = ref
+        return cls(references, select_metric)
+
+
+def load_reference(
+    path: Union[str, Path]
+) -> Union[HealthyReference, "ReferenceBank"]:
+    """Load whichever reference format sits at ``path``.
+
+    Args:
+        path: ``.npz`` archive holding either one reference or a bank.
+
+    Returns:
+        A :class:`ReferenceBank` when the archive carries one, otherwise a
+        single :class:`HealthyReference`.  Call sites take both, so pointing
+        ``reference.path`` at a bank is the only change a cadence-conditioned
+        run needs.
+    """
+    with np.load(Path(path), allow_pickle=True) as data:
+        is_bank = "bank" in data
+    return ReferenceBank.load(path) if is_bank else HealthyReference.load(path)
 
 
 def distance_threshold(
@@ -444,7 +658,9 @@ def build_healthy_reference(
 __all__ = [
     "HealthyReference",
     "MetricRange",
+    "ReferenceBank",
     "build_healthy_reference",
     "build_metric_ranges",
     "distance_threshold",
+    "load_reference",
 ]

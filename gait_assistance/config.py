@@ -155,16 +155,15 @@ class PhaseConfig:
     The defaults mirror ``heelstrike_detect.py`` of this repository.
 
     .. warning::
-       The default ``scheduled`` detector does not observe the patient at all:
-       it emits swing and stance on a fixed clock so the rest of the pipeline
-       can run before the real detector is merged.  Every phase-derived number
-       it produces describes the schedule, not the gait.
+       The default ``belt_length`` detector infers the phase from the belt
+       excursion alone.  The ``scheduled`` detector, still available, observes
+       nothing at all: it emits swing and stance on a fixed clock, and every
+       phase-derived number it produces describes the schedule, not the gait.
 
-       The two signal-driven detectors produce an **estimated** gait phase
-       inferred
-       from proximal kinematics (belt travel or shank angular rate).  Neither
-       observes foot-ground contact, so neither has been validated against a
-       ground-truth source.  The belt-velocity detector in particular marks
+       The signal-driven detectors produce an **estimated** gait phase inferred
+       from proximal kinematics (belt travel or shank angular rate).  None
+       observes foot-ground contact, so none has been validated against a
+       ground-truth source.  The belt-derived detectors in particular mark
        the whole belt-extension interval as SWING, which is longer than the
        biomechanical swing phase, so every phase-derived quantity
        (``swing_time``, ``stance_time``, ``swing_ratio``) is an estimate on an
@@ -174,11 +173,12 @@ class PhaseConfig:
        meaning; see ``ground_truth_validated`` on the detector classes.
     """
 
-    #: "scheduled" | "belt_velocity" | "gyro", plus anything a future module
-    #: registers through ``register_phase_detector``.  The default is the
-    #: fixed-cadence placeholder: it stands in for the real swing/stance
-    #: detector until that lands, and it is a clock, not a measurement.
-    detector: str = "scheduled"
+    #: "belt_cycle" | "belt_length" | "scheduled" | "belt_velocity" | "gyro",
+    #: plus anything a future module registers through
+    #: ``register_phase_detector``.  The default takes the stride boundary from
+    #: the belt and places swing/stance by cycle fraction: the belt's own
+    #: extended interval is 63 % of the stride, far longer than swing.
+    detector: str = "belt_cycle"
 
     # -- scheduled (fixed-cadence placeholder) ------------------------------ #
     #: stride period, heel strike to heel strike (s)
@@ -191,6 +191,41 @@ class PhaseConfig:
     #: shifts the whole cycle in time (s), so the first heel strike can be
     #: aligned with a recording instead of with the first sample
     scheduled_offset_s: float = 0.0
+
+    # -- belt_length (default; belt length is the only channel it reads) ---- #
+    #: SWING is entered on a rising crossing of ``+fraction * amplitude``
+    belt_swing_fraction: float = 0.3
+    #: STANCE (heel strike) on a falling crossing of ``-fraction * amplitude``;
+    #: together with the swing fraction this gap is the hysteresis band
+    belt_stance_fraction: float = 0.5
+    #: time constant of the baseline / amplitude envelope (s).  It has to be
+    #: long enough to average over a few strides and short enough to follow the
+    #: harness settling; 3 s is roughly two to three strides.
+    belt_envelope_tau_s: float = 3.0
+    #: below this belt excursion the patient is not walking (standing, slack
+    #: harness), so no events are emitted and no strides are cut (mm)
+    belt_min_amplitude_mm: float = 5.0
+
+    # -- belt_cycle (stride boundary from the belt, phases by fraction) ----- #
+    #: how much of the stride is swing
+    cycle_swing_fraction: float = 0.40
+    #: Where swing starts, as a fraction of the stride after the detected
+    #: boundary.
+    #:
+    #: Calibrated against the trunk IMU on four recordings in ``csv/``
+    #: (110500, 105057, 0p4_mps, TEST3), which agree closely:
+    #:
+    #: * the belt-derived boundary lands on a trunk initial contact to within
+    #:   40 ms, and on every *other* one - so it is the CONTRALATERAL foot;
+    #: * the instrumented leg's own contact is the next trunk peak, at 50-56 %
+    #:   of the detected cycle;
+    #: * the belt is nearly still over 55-93 % (that leg's foot is planted) and
+    #:   sweeps fastest over 24-40 % (that leg is swinging).
+    #:
+    #: So the instrumented leg toes off near 15 % and contacts near 55 % of the
+    #: detected cycle, which is the window set here.  The previous 0.60 put the
+    #: whole assistance inside that leg's stance.
+    cycle_swing_offset: float = 0.15
 
     # -- belt_velocity ------------------------------------------------------ #
     min_belt_mm: float = -130.0          #: negative -> belt <= value, positive -> belt >= value
@@ -396,12 +431,26 @@ class AssistConfig:
     """Assist gain, swing profile and belt target (spec 20-22)."""
 
     max_gain: float = 0.8
+    #: Bring-up override: when > 0 the gain is held at this value instead of
+    #: being computed from the deviation.  It exists to answer "can the wearer
+    #: feel anything at all", which the deficit-proportional gain cannot answer
+    #: on a wearer who has almost no deficit.  It bypasses the deviation score
+    #: and the OOD cap, but NOT the safety veto or the current limit.  ``0``
+    #: (the default) leaves the algorithm in charge - never leave it set for a
+    #: therapy run.
+    fixed_gain: float = 0.0
     max_gain_delta: float = 0.1
     ood_max_gain: float = 0.2         #: hard cap while out of distribution
     #: what the gain does while out of distribution: hold the previous value or
     #: drop to ``ood_safe_gain``.  Aggressive assistance is refused either way.
     ood_policy: OodAssistPolicy = OodAssistPolicy.HOLD
     ood_safe_gain: float = 0.0
+    #: consecutive OOD strides required before the OOD rule engages.  A single
+    #: out-of-distribution stride is routine whenever the stride segmentation
+    #: stumbles, and clamping the gain on it makes the assistance stutter; the
+    #: cap is meant for gait the model has really stopped recognising.  ``1``
+    #: restores the old behaviour of reacting to the first OOD stride.
+    required_consecutive_ood_strides: int = 5
     #: a deficit must persist this many consecutive strides before the gain is
     #: allowed to rise, and the gait must be back inside its healthy intervals
     #: this many consecutive strides before it is allowed to fall.  Guards the
@@ -422,6 +471,17 @@ class ImpedanceConfig:
     stiffness_n_per_mm: float = 0.005
     damping_n_per_mms: float = 0.005
     current_limit_a: float = 1.0
+    #: Peak feed-forward assist force (N) at gain 1.0 and the top of the swing
+    #: profile.  ``0`` reproduces the pure position/velocity law.
+    #:
+    #: Without it the only assistance is the spring pulling towards a displaced
+    #: target, so the force the wearer feels is
+    #: ``stiffness * gain * max_retraction`` - 0.4 N at the defaults, which is
+    #: imperceptible.  Raising ``stiffness`` instead would scale the assistance
+    #: and the belt-tracking resistance together, since the belt swings about
+    #: the baseline by roughly the same distance the assistance displaces the
+    #: target.  This term scales the assistance alone.
+    assist_force_n: float = 0.0
     #: use the PAD force->current map from ``pad_external_control_lib`` when
     #: available; otherwise ``current_per_newton`` is used
     use_pad_force_map: bool = True

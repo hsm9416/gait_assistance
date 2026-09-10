@@ -208,11 +208,21 @@ ss_symmetry_ratio        = ss_ratio_paretic / ss_ratio_nonparetic
 | `BIOMECH_DEFICIT_ONLY` | `E_R = 0`, `E_B > 0` | 기본 수준 (`base_factor`) |
 | `MANIFOLD_DEVIATION_ONLY` | `E_R > 0`, `E_B = 0` | **없음** — 로그·감시만 |
 | `COMBINED_DEVIATION` | `E_R > 0`, `E_B > 0` | 강화 |
-| `OOD` | 기존 OOD 조건 | 강한 보조 금지 (hold 또는 safe minimum) |
+| `OOD` | OOD가 `required_consecutive_ood_strides`회 연속 | 강한 보조 금지 (hold 또는 safe minimum) |
 
 OOD에서의 동작은 `assist.ood_policy`로 고릅니다: `hold`(기본)는 직전 게인을
 유지하고 `safe_minimum`은 `assist.ood_safe_gain`으로 내려갑니다. 어느 쪽이든
 `assist.ood_max_gain`을 넘지 않습니다.
+
+단, OOD 1회로는 걸리지 않습니다. stride 분할이 한 번 흔들리면 그 stride는
+어느 군집과도 닮지 않아 OOD로 뜨는데, 거기서 게인을 묶으면 착용자는 보조가
+중간에 끊기는 것으로 느낍니다. 그래서
+`assist.required_consecutive_ood_strides`(기본 5)회 **연속**으로 떠야 규칙이
+발동하고, 중간에 정상 stride가 하나 끼면 카운트는 0으로 돌아갑니다. 1로 두면
+첫 OOD stride에 바로 반응하는 이전 동작이 됩니다.
+
+로그에는 둘이 따로 남습니다: `ood`는 그 stride의 원래 플래그,
+`ood_engaged`는 규칙이 실제로 게인을 묶었는지입니다.
 
 ## 연속 stride 조건 (persistence)
 
@@ -239,19 +249,41 @@ delta_healthy = baseline_healthy_distance - current_healthy_distance
 
 양수면 세션 시작 시점보다 healthy region에 가까워진 것입니다.
 
-## 보행 속도 조건화 (인터페이스만 준비)
+## 보행 속도(cadence) 조건화
 
-swing/stance ratio는 보행 속도의 영향을 받으므로 healthy reference가 향후
-speed-conditioned reference를 지원할 수 있도록 인터페이스를 열어 두었습니다.
+**하나의 healthy reference는 그것이 녹화된 속도에서만 비교 가능합니다.** 같은
+사람이 느리게 걸으면 stride 시간은 길어지고 벨트 가동범위는 작아지므로, 빠른
+속도의 기준과 비교하면 **없는 결핍이 만들어집니다.**
+
+실측 예(동일인, 동일 검출기, 0.4 m/s 녹화 재생):
+
+| 기준 | E_B 평균 | belt_excursion error | gain 최대 |
+|---|---|---|---|
+| 1.0 m/s 단일 기준 | 0.134 | 0.178 | 0.110 |
+| cadence 선택(→ 0p4) | **0.010** | **0.008** | **0.000** |
+
+그래서 `ReferenceBank`가 **속도별 reference를 각각 보관하고, stride마다 그
+stride의 `stride_time`이 들어가는 구간의 reference를 고릅니다.**
 
 ```python
-HealthyReference.get_metric_range(metric="swing_ratio", walking_speed=current_speed)
+bank = ReferenceBank.from_files({"0p4": ..., "0p6": ..., "0p8": ..., "1p0": ...})
+bank.select(1.76)        # -> "0p4"
 ```
 
-현재 구현은 속도를 무시하고 전체 population 구간을 반환합니다
-(`speed_conditioned = False`). 향후 speed bin / nearest speed group /
-regression-based expected value 중 어느 방식으로 확장하더라도 호출부는 바뀌지
-않습니다.
+- 조건 변수가 m/s가 아니라 **`stride_time`** 인 이유: 장치가 실제로 측정하는
+  값입니다. 벨트 장착 센서는 지면 속도를 모릅니다.
+- 구간 안에 들어가는 reference가 없으면 **가장 가까운** 것을 고릅니다. cadence를
+  알 수 없으면(`NaN`) **가장 느린** reference를 고릅니다 — 속도를 과대추정하는
+  쪽이 없는 결핍을 만드는 방향이기 때문입니다.
+- `reference_source` 컬럼에 `healthy_reference:0p4` 처럼 **어느 cadence가 그
+  stride를 채점했는지** 기록됩니다.
+- 전환되는 것은 `metric_ranges`(E_B), `Z_healthy`·임계값(E_R·`d_healthy`)입니다.
+  **OOD는 바뀌지 않습니다** — OOD는 healthy reference가 아니라 환자 자신의
+  baseline 군집 거리로 판정하기 때문입니다.
+
+`reference.path`에 bank 파일을 주면 끝이고(`load_reference()`가 형식을 판별),
+단일 reference 경로는 그대로 동작합니다. `exp.py`의 `REFERENCE = "bank"`를
+`"single"`로 바꾸면 이전 동작으로 되돌아갑니다.
 
 행렬 로그는 `scipy.linalg.logm`이 아니라 항상 `numpy.linalg.eigh`로 계산하고,
 고유값을 `epsilon`에서 클리핑하기 때문에 특이행렬에 가까운 공분산이 들어와도
@@ -312,7 +344,7 @@ gait_assistance/
   offline_sim.py       CSV 리플레이 파이프라인
   plotting.py          결과 그림 (PCA는 표시 전용)
   sensors/             imu.py, encoder.py (+ MockMotor/PadMotor), sensor_manager.py
-  gait/                phase_detector.py (scheduled placeholder + seam),
+  gait/                phase_detector.py (belt-length detector + seam),
                        stride_segmenter.py,
                        feature_extractor.py (GaitMetrics), normalization.py,
                        symmetry.py (좌우 대칭, 반대측 있을 때만)
@@ -375,8 +407,8 @@ raw_assist_gain, assist_gain, target_belt_length,
     motor_position, motor_velocity, motor_current
 ```
 
-위상 파생 값에 `estimated_` 접두어가 붙는 이유는 아래 "보행 위상은 추정값이다"
-절을 보십시오. **측정되지 않은 값은 0이 아니라 빈 칸**으로 기록됩니다.
+위상 파생 값에 `estimated_` 접두어가 붙는 이유는 아래 "보행 위상" 및
+"신호 기반 검출기는 추정값이다" 절을 보십시오. **측정되지 않은 값은 0이 아니라 빈 칸**으로 기록됩니다.
 
 `results.png`의 9개 패널: log-SPD PCA(healthy region 포함), `d_healthy`(임계선
 포함), `d_patient`, swing ratio(정상 구간 밴드 포함), belt excursion(정상 구간
@@ -388,7 +420,7 @@ raw_assist_gain, assist_gain, target_belt_length,
 ```
 [mode] baseline_stabilization
 [mode] no healthy reference -> the target is this patient's own baseline. ...
-[phase] BeltVelocityPhaseDetector: ESTIMATED phase from belt extension velocity
+[phase] BeltLengthPhaseDetector: ESTIMATED phase from belt length excursion
         (proximal proxy), not validated against foot contact (FSR / foot IMU pending)
 [warn] no healthy reference: running in BASELINE_STABILIZATION, ...
 ```
@@ -408,70 +440,96 @@ live 경로는 상위 디렉터리의 기존 드라이버를 그대로 사용합
 `connect.PadController`(`PadSensorSource`), 전류 명령은 `PadMotor`,
 힘-전류 변환은 `pad_external_control_lib.force_to_current_a`를 사용하며,
 해당 라이브러리를 임포트할 수 없을 때를 대비해 동일한 로컬 대체 구현이 있습니다.
-기본 위상 검출기는 `heelstrike_detect.py`를 포팅한 것이라 기존 튜닝값이 그대로
-적용됩니다. 다만 그 튜닝값 역시 벨트 신호에 맞춘 것이지 접촉 ground truth에
-맞춘 것이 아니므로, 위 "보행 위상은 추정값이다" 절의 제약이 그대로 따라옵니다.
+`heelstrike_detect.py`를 포팅한 검출기는 `--set phase.detector=belt_velocity`로
+남아 있어 기존 튜닝값을 그대로 쓸 수 있습니다. 다만 기본값은 벨트 길이만 읽는
+`BeltLengthPhaseDetector`이며, 어느 쪽이든 벨트 신호에 맞춘 것이지 접촉 ground
+truth에 맞춘 것이 아니므로 아래 "보행 위상" 절의 제약이 그대로 따라옵니다.
 
 `sensor.csv_column_map`은 기본값이 비어 있는데, 기존 수집 스크립트의 CSV 컬럼
 (`host_time_s`, `belt_length`, `motor_iq_meas`, `accel_*`, `gyro_*`, ...)이
 자동으로 인식되기 때문입니다.
 
-## 보행 위상: 지금은 고정 캐이던스 placeholder
+## 보행 위상: 벨트 길이만으로 판별
 
-실제 swing/stance 검출 코드는 나중에 합칠 예정이므로, 기본 검출기는
-`ScheduledPhaseDetector`입니다. **센서를 전혀 보지 않고 타임스탬프만으로**
-규칙적인 swing/stance를 만들어 나머지 파이프라인을 끝까지 돌릴 수 있게 합니다.
+기본 검출기는 `BeltLengthPhaseDetector`이며, **`belt_length` 채널 하나만** 읽습니다.
+속도 채널도, IMU도, 시계도 보지 않습니다. 벨트는 다리가 앞으로 나가는 동안 늘어나고
+heel strike 부근에서 다시 줄어들기 때문에, 그 출렁임에 슈미트 트리거를 겁니다.
+
+절대 벨트 길이에 직접 문턱값을 걸 수는 없습니다 — 안착 길이가 환자마다, 착용마다
+다르고 같은 세션 안에서도 하네스가 자리를 잡으며 흘러갑니다. 그래서 신호를
+신호 자신에 대해 측정합니다.
 
 ```
-u = (t - t0 - offset) mod period
-u <  stance_duration  ->  STANCE, progress = u / stance_duration
-u >= stance_duration  ->  SWING,  progress = (u - stance) / swing
+baseline  <- EMA(belt_length, tau)     느린 성분 (드리프트, 자세)
+x         <- belt_length - baseline    그 주위의 출렁임
+amplitude <- EMA(|x|, tau)             현재 사이클 크기
+
+x >= +belt_swing_fraction  * amplitude  ->  SWING   (toe-off)
+x <= -belt_stance_fraction * amplitude  ->  STANCE  (heel strike)
 ```
 
-타이밍은 전부 조정 가능합니다.
+두 문턱값이 baseline을 사이에 두고 벌어져 있고, 그 간격이 노이즈로 인한 채터링을
+막는 히스테리시스입니다. `refractory_s`가 heel strike 최소 간격을 한 번 더 잡습니다.
 
 | 설정 | 기본값 | 의미 |
 |---|---|---|
-| `phase.scheduled_period_s` | `1.2` | stride 주기 (HS→HS, 초) |
-| `phase.scheduled_swing_ratio` | `0.40` | 주기 중 swing 비율 |
-| `phase.scheduled_swing_duration_s` | `0.0` | swing을 초 단위로 직접 지정 (0이면 비율 사용) |
-| `phase.scheduled_offset_s` | `0.0` | 사이클 전체를 시간축에서 이동 |
+| `phase.belt_swing_fraction` | `0.3` | `+f*amplitude` 상향 교차 시 SWING 진입 |
+| `phase.belt_stance_fraction` | `0.5` | `-f*amplitude` 하향 교차 시 STANCE(=heel strike) |
+| `phase.belt_envelope_tau_s` | `3.0` | baseline/amplitude 포락선 시정수 (초, 약 2~3 stride) |
+| `phase.belt_min_amplitude_mm` | `5.0` | 이보다 출렁임이 작으면 보행이 아님 → 이벤트 없음 |
+| `phase.refractory_s` | `0.35` | heel strike 최소 간격 (초) |
+
+이 방식의 실질적인 이점:
+
+* **착용 위치·드리프트에 무관** — 벨트 길이를 통째로 500 mm 옮겨도 이벤트 시각이
+  한 샘플도 바뀌지 않습니다. 기존 `belt_velocity` 검출기가 쓰던 `min_belt_mm = -130`
+  같은 녹화별 절대 문턱값 튜닝이 사라집니다.
+* **보폭 크기에 무관** — 진폭이 40 mm든 160 mm든 같은 시점에 발화합니다.
+* **서 있으면 아무것도 안 나옵니다** — 출렁임이 `belt_min_amplitude_mm` 아래면
+  stride 자체가 잘리지 않고, 따라서 보조도 나가지 않습니다.
+
+`csv/`의 실제 녹화로 검증한 결과(기준: 벨트 신호의 자기상관 주기, 검출기와 무관한
+독립 추정):
+
+| 녹화 | 자기상관 주기 | 검출 stride 수 | 검출 중앙 간격 | 간격 CV |
+|---|---|---|---|---|
+| `imu_hs_torque_20260826_110500` | 1.231 s | 49 (기대 49) | 1.225 s | 0.027 |
+| `imu_hs_torque_20260826_105057` | 1.859 s | 19 (기대 20) | 1.864 s | 0.042 |
+| `raw_0p4_mps_..._105902` | 1.926 s | 30 (기대 31) | 1.929 s | 0.048 |
+
+주기성이 뚜렷한 세 녹화에서 stride 수 오차 1개 이내, 검출 간격이 자기상관 주기와
+5 ms 안에서 일치합니다. (참고로 같은 파일에서 기존 `belt_velocity` 검출기는
+`raw_0p4_mps`를 39개로 과검출했습니다.)
+
+포락선이 자리 잡는 데 약 1 tau가 걸리므로 세션 첫 2~3 stride는 heel strike가 수십 ms
+일찍 잡힙니다. baseline 수집 구간 안이고, 그 뒤로는 주기가 정확합니다.
+
+> **여전히 접촉 측정이 아닙니다.** 이건 *벨트* 이벤트입니다. SWING 구간은 벨트가
+> 자기 baseline을 넘어 늘어나기 시작할 때 시작되는데 이는 실제 toe-off보다 앞서므로,
+> 추정 swing ratio(`csv/`의 녹화에서 약 0.65)는 접촉 기반 값보다 높게 나옵니다.
+> FSR 인솔이나 발등 IMU로 검증하기 전까지는 **같은 환자 안에서의 상대 비교**로만
+> 쓰십시오. `phase_source = "belt_length_derived"`가 로그에 남습니다.
+
+### 다른 검출기로 바꾸기
 
 ```bash
-python -m gait_assistance.main offline data.csv \
-    --set phase.scheduled_period_s=0.9 \
-    --set phase.scheduled_swing_ratio=0.35
+--set phase.detector=belt_velocity   # 기존 heelstrike_detect.py 포팅 (속도 기반)
+--set phase.detector=gyro            # 정강이 각속도 기반
+--set phase.detector=scheduled       # 센서를 안 보는 고정 캐이던스 placeholder
 ```
 
-`swing_duration_s()`는 stance가 항상 양수로 남도록 클램프하므로, swing이 주기를
-통째로 삼키는 설정은 만들어지지 않습니다.
-
-> **이건 시계이지 측정이 아닙니다.** 여기서 나오는 캐이던스는 설정한 값 그대로이며
-> 환자의 실제 보행과 일치한다면 우연입니다. `swing_time`, `stance_time`, 모든
-> ratio, 모든 symmetry는 환자를 설명하지 않습니다. 그래서 이 검출기는
-> `is_placeholder = True`, `phase_source = "scheduled"`를 선언하고, 리포트에서
-> "ESTIMATED"가 아니라 **"PLACEHOLDER"** 로 표시됩니다.
-
-### 결과적으로 지금 죽어 있는 항
-
-캐이던스가 고정이면 `swing_ratio`는 매 stride 정확히 같은 값이므로 정상 구간을
-벗어날 수 없습니다. 즉 **`swing_ratio` deficit 항은 실제 검출기가 들어오기 전까지
-발화하지 않습니다.** 실행 시 경고로 알려줍니다.
+`scheduled`는 환자 없이 파이프라인만 돌릴 때를 위해 남아 있습니다. 센서를 전혀
+읽지 않고 `scheduled_period_s`(기본 1.2초) 시계로 swing/stance를 만들며,
+`is_placeholder = True`라서 리포트에 "ESTIMATED"가 아닌 **"PLACEHOLDER"** 로
+표시되고, 실행 시 아래 경고가 함께 나옵니다.
 
 ```
 [warn] these weighted terms cannot fire until the real detector lands: swing_ratio.
-       Assistance can currently only be driven by the sensor-derived terms.
 ```
 
-가중치를 조용히 바꾸지는 않습니다 — 실제 검출기가 붙는 순간 그대로 살아나야 하기
-때문입니다. 지금 보조를 움직일 수 있는 것은 센서에서 직접 나오는
-`belt_excursion` deficit입니다.
-
-기존 신호 기반 검출기는 그대로 남아 있어 한 줄로 되돌릴 수 있습니다.
-
-```bash
---set phase.detector=belt_velocity     # 또는 gyro
-```
+고정 캐이던스에서는 `swing_ratio`가 매 stride 같은 값이라 deficit 항이 발화할 수
+없기 때문입니다. 기본 검출기에서는 이 경고가 나오지 않습니다 — 벨트에서 나온
+`swing_ratio`는 stride마다 달라지므로 해당 항이 살아 있습니다.
 
 ## 실제 검출기를 붙이는 자리
 
@@ -502,16 +560,16 @@ register_phase_detector("fsr", FsrPhaseDetector)
 
 ## 신호 기반 검출기는 "추정값"이다
 
-(아래는 `phase.detector`를 `belt_velocity` 또는 `gyro`로 바꿨을 때의 이야기입니다.)
+(기본 `belt_length`를 포함해 `belt_velocity`, `gyro` 모두에 해당합니다.)
 
-두 검출기 모두 **추정된 보행 위상(estimated gait phase)** 을
-내놓습니다. 어느 쪽도 발-지면 접촉을 관측하지 않고, 벨트 이동량이나 정강이
+세 검출기 모두 **추정된 보행 위상(estimated gait phase)** 을
+내놓습니다. 어느 것도 발-지면 접촉을 관측하지 않고, 벨트 이동량이나 정강이
 각속도라는 **근위부 대리 신호(proximal proxy)** 로부터 위상을 추론합니다.
 따라서 아직 **어떤 ground truth로도 검증되지 않았습니다.**
 
 * 위상 경계는 실제 toe-off / heel strike가 아니라 *벨트* 또는 *정강이* 이벤트의
   경계이며, 그 사이 시간 오프셋은 측정된 바 없습니다.
-* 벨트 속도 검출기는 *벨트가 늘어나는* 구간 전체를 SWING으로 표시하는데, 이는
+* 벨트 기반 검출기는 *벨트가 늘어나는* 구간 전체를 SWING으로 표시하는데, 이는
   생체역학적 유각기보다 깁니다. 즉 `swing_time`, `stance_time`, `swing_ratio`는
   **눈금이 교정되지 않은 추정치**이며, 0.38 같은 문헌 정상값과 비교하면 안 됩니다.
 * 정직한 사용법은 *상대 비교*뿐입니다 — 같은 환자의 다른 스트라이드를 같은

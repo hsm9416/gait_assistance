@@ -343,6 +343,237 @@ class ScheduledPhaseDetector(PhaseDetector):
         return self._result(event, float(min(max(progress, 0.0), 1.0)))
 
 
+class BeltLengthPhaseDetector(PhaseDetector):
+    """Swing/stance from the belt length alone - the default detector.
+
+    Only ``belt_length`` is read: no velocity channel, no IMU, no clock.  The
+    belt extends while the leg swings forward and retracts again around heel
+    strike, so the phase is a Schmitt trigger on that excursion.
+
+    Absolute belt lengths cannot be thresholded directly - the resting length
+    differs per patient, per fitting, and drifts within a session as the
+    harness settles - so the detector measures the signal against itself::
+
+        baseline  <- EMA(belt_length, tau)     slow component (drift, posture)
+        x         <- belt_length - baseline    excursion about it
+        amplitude <- EMA(|x|, tau)             running size of the cycle
+
+        x >= +belt_swing_fraction  * amplitude  ->  SWING   (toe-off)
+        x <= -belt_stance_fraction * amplitude  ->  STANCE  (heel strike)
+
+    The two thresholds straddle the baseline, and that gap is the hysteresis
+    that stops noise from chattering between the phases; ``refractory_s``
+    additionally floors the interval between heel strikes.
+
+    While the amplitude stays below ``belt_min_amplitude_mm`` the belt is not
+    swinging at all - a standing patient, a slack harness - and no event is
+    emitted, so no strides are cut and no assistance is produced.
+
+    The envelope needs roughly one ``belt_envelope_tau_s`` to settle, so the
+    first two or three strides of a session trip the falling threshold a few
+    tens of milliseconds early.  That is well inside the baseline-collection
+    window, and the stride period is exact afterwards.
+
+    Like every detector here it reports a *belt* event, not foot contact: the
+    SWING interval starts when the belt has extended past its own baseline,
+    which precedes toe-off, so the estimated swing ratio (~0.65 on the
+    recordings in ``csv/``) runs high against a contact-derived one.  Use it as
+    a within-patient relative measure until it is checked against an FSR
+    insole or a foot-mounted IMU.
+    """
+
+    phase_source = "belt_length_derived"
+    estimates_from = "belt length excursion (proximal proxy)"
+
+    def __init__(self, config: Optional[PhaseConfig] = None) -> None:
+        super().__init__(config)
+        self._swinging = False
+        self._last_event_t = -1.0e9
+        self._baseline: Optional[float] = None
+        self._amplitude = 0.0
+        self._prev_t: Optional[float] = None
+
+    def reset(self) -> None:
+        """Return the detector to its initial state, envelope included."""
+        super().reset()
+        self._swinging = False
+        self._last_event_t = -1.0e9
+        self._baseline = None
+        self._amplitude = 0.0
+        self._prev_t = None
+
+    @property
+    def baseline_mm(self) -> Optional[float]:
+        """Current slow component of the belt length, or ``None`` before the
+        first sample."""
+        return self._baseline
+
+    @property
+    def amplitude_mm(self) -> float:
+        """Current running excursion amplitude of the belt length (mm)."""
+        return self._amplitude
+
+    @property
+    def is_walking(self) -> bool:
+        """True while the belt excursion is large enough to emit events."""
+        return self._amplitude >= self.config.belt_min_amplitude_mm
+
+    def update(self, sample: SensorSample) -> PhaseResult:
+        """Feed one sensor frame and return the estimated phase and any event.
+
+        Args:
+            sample: current sensor frame; only ``belt_length`` and
+                ``timestamp`` are read.
+
+        Returns:
+            The detected :class:`PhaseResult`.  A non-finite belt reading
+            leaves the envelope untouched and emits no event, so a corrupt
+            frame cannot poison the detector state.
+        """
+        event = self._track(sample)
+        t = sample.timestamp
+        if event is GaitEvent.TOE_OFF:
+            self._enter(GaitPhase.SWING, t)
+        elif event is GaitEvent.HEEL_STRIKE:
+            self._register_heel_strike(t)
+            self._enter(GaitPhase.STANCE, t)
+        return self._result(event, self._progress(t))
+
+    def _track(self, sample: SensorSample) -> Optional[GaitEvent]:
+        """Advance the envelope and return the Schmitt trigger's event.
+
+        Split out from :meth:`update` so a detector that keeps the belt
+        *timing* but places the phases differently can reuse it without
+        inheriting the level-based phase assignment.
+
+        Args:
+            sample: current sensor frame.
+
+        Returns:
+            The event this sample produced, or ``None``.
+        """
+        cfg = self.config
+        t = sample.timestamp
+        belt = sample.belt_length
+        if not np.isfinite(belt) or not np.isfinite(t):
+            return None
+
+        if self._baseline is None or self._prev_t is None:
+            self._baseline = float(belt)
+            self._amplitude = 0.0
+            self._prev_t = float(t)
+            return None
+
+        alpha = self._envelope_alpha(t - self._prev_t)
+        self._prev_t = float(t)
+        self._baseline += (float(belt) - self._baseline) * alpha
+        excursion = float(belt) - self._baseline
+        self._amplitude += (abs(excursion) - self._amplitude) * alpha
+
+        if self._amplitude < cfg.belt_min_amplitude_mm:
+            return None
+        if not self._swinging and excursion >= cfg.belt_swing_fraction * self._amplitude:
+            self._swinging = True
+            return GaitEvent.TOE_OFF
+        if self._swinging and excursion <= -cfg.belt_stance_fraction * self._amplitude:
+            if (t - self._last_event_t) >= cfg.refractory_s:
+                self._swinging = False
+                self._last_event_t = t
+                return GaitEvent.HEEL_STRIKE
+        return None
+
+    def _envelope_alpha(self, dt: float) -> float:
+        """EMA weight for a step of ``dt`` seconds.
+
+        Deriving the weight from the elapsed time keeps the envelope's time
+        constant honest when the loop rate changes or a frame is dropped.
+        """
+        tau = max(float(self.config.belt_envelope_tau_s), 1e-3)
+        return float(1.0 - np.exp(-max(float(dt), 0.0) / tau))
+
+
+class BeltCyclePhaseDetector(BeltLengthPhaseDetector):
+    """Belt-triggered stride boundary, phases placed by cycle fraction.
+
+    :class:`BeltLengthPhaseDetector` calls the belt's extended half SWING,
+    which on the recordings in ``csv/`` is 63 % of the stride - the belt is not
+    the limb, and its extension interval is much longer than the biomechanical
+    swing (~40 %).  Assistance placed on that interval is spread over most of
+    the cycle instead of the part that needs it.
+
+    This detector keeps what the belt does well and drops what it does badly.
+    The stride *boundary* is taken from the same Schmitt trigger, whose timing
+    is good - the detected stride intervals track the belt's autocorrelation
+    period to within 5 ms.  The swing/stance *split* is then placed by fraction
+    of the measured stride period::
+
+        u = (t - t_heel_strike) / stride_period
+        cycle_swing_offset <= u < cycle_swing_offset + cycle_swing_fraction
+            -> SWING, progress = (u - offset) / fraction
+        otherwise
+            -> STANCE
+
+    ``cycle_swing_fraction`` sets how long the swing is and
+    ``cycle_swing_offset`` sets where it starts, both as fractions of the
+    stride.  This is a calibration, not a measurement: nothing in this device's
+    data observes foot contact - the IMU sits on the frame, not the limb, and
+    shows no gait rotation (a few deg/s) - so the offset has to be tuned until
+    it lines up with what the wearer feels, or against a foot switch.  Until
+    then treat both numbers as settings, and the phase as an estimate placed by
+    hand on a reliable stride clock.
+    """
+
+    phase_source = "belt_cycle"
+    estimates_from = "belt stride boundary + configured cycle fractions"
+
+    def update(self, sample: SensorSample) -> PhaseResult:
+        """Feed one sensor frame and return the estimated phase and any event.
+
+        Args:
+            sample: current sensor frame; only ``belt_length`` and
+                ``timestamp`` are read.
+
+        Returns:
+            The detected :class:`PhaseResult`.  Before the first full stride
+            the period is unknown, so the phase stays STANCE and no assistance
+            is placed.
+        """
+        cfg = self.config
+        t = sample.timestamp
+        event = self._track(sample)
+        if event is GaitEvent.HEEL_STRIKE:
+            self._register_heel_strike(t)
+
+        if self._last_hs_t is None or self._stride_period_s is None:
+            if event is GaitEvent.HEEL_STRIKE:
+                self._enter(GaitPhase.STANCE, t)
+            return self._result(
+                GaitEvent.HEEL_STRIKE if event is GaitEvent.HEEL_STRIKE else None, None
+            )
+
+        fraction = float(np.clip(cfg.cycle_swing_fraction, 0.01, 0.99))
+        offset = float(np.clip(cfg.cycle_swing_offset, 0.0, 1.0 - fraction))
+        u = (t - self._last_hs_t) / max(self._stride_period_s, 1e-6)
+        u = float(np.clip(u, 0.0, 1.0))
+        in_swing = offset <= u < offset + fraction
+
+        emitted: Optional[GaitEvent] = None
+        if event is GaitEvent.HEEL_STRIKE:
+            self._enter(GaitPhase.STANCE, t)
+            emitted = GaitEvent.HEEL_STRIKE
+        elif in_swing and self._phase is GaitPhase.STANCE:
+            self._enter(GaitPhase.SWING, t)
+            emitted = GaitEvent.TOE_OFF
+        elif not in_swing and self._phase is GaitPhase.SWING:
+            self._enter(GaitPhase.STANCE, t)
+
+        progress = (u - offset) / fraction if in_swing else None
+        if progress is None and self._phase is GaitPhase.STANCE:
+            span = max(1.0 - fraction, 1e-6)
+            progress = float(np.clip((u if u < offset else u - fraction) / span, 0.0, 1.0))
+        return self._result(emitted, None if progress is None else float(np.clip(progress, 0.0, 1.0)))
+
+
 class BeltVelocityPhaseDetector(PhaseDetector):
     """Belt-velocity state machine ported from ``heelstrike_detect.py``.
 
@@ -453,6 +684,8 @@ class GyroPhaseDetector(PhaseDetector):
 #: itself here through :func:`register_phase_detector` rather than by editing
 #: this file.
 PHASE_DETECTORS: Dict[str, Callable[[Optional[PhaseConfig]], PhaseDetector]] = {
+    "belt_cycle": BeltCyclePhaseDetector,
+    "belt_length": BeltLengthPhaseDetector,
     "scheduled": ScheduledPhaseDetector,
     "belt_velocity": BeltVelocityPhaseDetector,
     "gyro": GyroPhaseDetector,
@@ -513,6 +746,8 @@ def create_phase_detector(config: Optional[PhaseConfig] = None) -> PhaseDetector
 
 __all__ = [
     "PHASE_DETECTORS",
+    "BeltCyclePhaseDetector",
+    "BeltLengthPhaseDetector",
     "BeltVelocityPhaseDetector",
     "ScheduledPhaseDetector",
     "register_phase_detector",
